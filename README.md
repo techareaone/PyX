@@ -1,4 +1,4 @@
-# PyX — EXE Builder
+# PyX Wizard — EXE Builder
 
 > A [TRADELY](https://doc.tradely.dev) Project
 
