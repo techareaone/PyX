@@ -1,2 +1,0 @@
-# PyX
-A TRADELY PROJECT.
