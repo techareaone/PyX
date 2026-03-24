@@ -2,7 +2,7 @@
 
 > A [TRADELY](https://doc.tradely.dev) Project
 
-[!WARNING] The releases here are commonly flagged as malware due to their nature of operating with exes. We do not recommend you run unknown software on your device! We provide all python code of our program in the [Python Folder](python) .
+⚠️ **Warning:** The releases here are commonly flagged as malware due to their nature of operating with exes. We do not recommend you run unknown software on your device! We provide all python code of our program in the [Python Folder](python) .
 
 PyX is a graphical wizard that packages Python scripts into standalone Windows executables. It automates virtual environment creation, dependency detection, PyInstaller orchestration, and optional code signing — all through a step-by-step GUI requiring no command-line interaction.
 
