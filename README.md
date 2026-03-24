@@ -1,6 +1,6 @@
 # PyX — EXE Builder
 
-> A [TRADELY](https://tradely.dev) Project
+> A [TRADELY](https://doc.tradely.dev) Project
 
 PyX is a graphical wizard that packages Python scripts into standalone Windows executables. It automates virtual environment creation, dependency detection, PyInstaller orchestration, and optional code signing — all through a step-by-step GUI requiring no command-line interaction.
 
