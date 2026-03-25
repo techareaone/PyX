@@ -738,9 +738,14 @@ class _PyXWizard:
         _header("SCRIPT LOCATION")
 
         if script_path.lower() == "self":
-            # Package the calling script
-            frame = inspect.stack()[1]
-            caller_file = frame.filename
+            # Package the calling script — walk the stack to find the first
+            # frame that is outside this module (skips the module-level wrapper).
+            _this_file = os.path.abspath(__file__)
+            caller_file = None
+            for _frame in inspect.stack():
+                if os.path.abspath(_frame.filename) != _this_file:
+                    caller_file = _frame.filename
+                    break
             if caller_file and os.path.isfile(caller_file):
                 self._script_path = Path(caller_file).resolve()
                 self._self_mode = True
@@ -799,7 +804,7 @@ class _PyXWizard:
         _info(f"Output directory: {project_dir}")
 
         if project_dir.exists():
-            _warn("Project directory already exists. Virtual environment will be reused.")
+            _warn("Project directory already exists. Cleaned script will be overwritten; virtual environment will be reused.")
 
         existing = count_existing_projects(base_dir)
         _info(f"Existing projects in PyX_Data: {existing}")
@@ -1061,6 +1066,14 @@ class _PyXWizard:
                 _info("Stripping pyxwizard commands from self-referencing script...")
                 self._log("Stripping pyxwizard library calls from script (self mode)...")
                 stripped_script = _strip_pyxwizard_from_script(self._script_path, temp_dir)
+                # Save the cleaned script into the PyX_Data project folder,
+                # overwriting any previous copy so stale files are never reused.
+                cleaned_in_project = project_dir / self._script_path.name
+                cleaned_in_project.write_text(
+                    stripped_script.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                self._log(f"Cleaned script written to: {cleaned_in_project}")
+                _info(f"Cleaned script saved → {cleaned_in_project}")
                 preprocessed_script = preprocess_script(stripped_script, temp_dir)
             else:
                 preprocessed_script = preprocess_script(self._script_path, temp_dir)

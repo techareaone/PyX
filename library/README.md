@@ -19,7 +19,7 @@ PyXWizard.build()
 | Command | Required | Default | Description |
 |---|---|---|---|
 | `PyXWizard.begin()` | Yes | — | Initialise PyX, fetch lib categories |
-| `PyXWizard.location(path)` | Yes | — | Script path or `"self"` |
+| `PyXWizard.location(path)` | Yes | — | Script path or `"self"` (`"self"` does not work with Data Folders.) |
 | `PyXWizard.name(name)` | Yes | — | Project name (= EXE filename) |
 | `PyXWizard.author(name)` | No | `TRADELY.DEV` | Author metadata |
 | `PyXWizard.console(bool)` | No | `True` | Show console window |
@@ -38,7 +38,7 @@ PyXWizard.build()
   packaged copy.
 - **Data folders**: Files in bundled folders are accessible at runtime with 
   `"packaged-within-exe:folder_name/file.ext"` string literals (auto-rewritten 
-  by the preprocessor).
+  by the preprocessor). PyXWizard.location("self").
 - **Venv reuse**: Building the same project name twice reuses the existing 
   virtual environment instead of recreating it.
 - **Library categories**: On `begin()`, PyX fetches a remote JSON of known 

@@ -11,5 +11,5 @@ from .pyxwizard import (
     build,
 )
 
-__version__ = "0.28b0"
+__version__ = "0.28c1"
 __author__ = "TRADELY.DEV"
