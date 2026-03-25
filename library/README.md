@@ -38,7 +38,7 @@ PyXWizard.build()
   packaged copy.
 - **Data folders**: Files in bundled folders are accessible at runtime with 
   `"packaged-within-exe:folder_name/file.ext"` string literals (auto-rewritten 
-  by the preprocessor). PyXWizard.location("self").
+  by the preprocessor). Exclusion is: PyXWizard.location("self"). This can not contain Data Folders.
 - **Venv reuse**: Building the same project name twice reuses the existing 
   virtual environment instead of recreating it.
 - **Library categories**: On `begin()`, PyX fetches a remote JSON of known 
