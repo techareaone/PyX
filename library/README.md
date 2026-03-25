@@ -49,4 +49,6 @@ PyXWizard.build()
   ## Further Details
 
 Check out [PyX Wizard by TRADELY](https://doc.tradely.dev)
+PyPi Library available at: [PyPi PyXWizard](https://pypi.org/project/PyXWizard/)
 
+Use the README there to set up the library.
