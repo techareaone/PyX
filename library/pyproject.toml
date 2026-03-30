@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PyXWizard"
-version = "0.28.4"
+version = "0.29.0"
 description = "Package Python scripts into standalone Windows executables — a TRADELY PROJECT"
 readme = "README.md"
 license = "Apache-2.0"
