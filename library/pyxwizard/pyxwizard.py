@@ -1,25 +1,55 @@
 #!/usr/bin/env python3
 """
 PyX Wizard – Terminal Library Edition
-======================================
+==========================================
 A Python library that packages Python scripts into standalone Windows
 executables using PyInstaller, with automatic dependency detection,
 virtual environment isolation, optional code signing, and data bundling.
 
-Usage
------
+Now with:
+  • Step-by-step callback hooks for GUI integration
+  • Rich build result objects with full metadata
+  • Version info embedding (file properties on Windows)
+  • Splash screen support
+  • Cleanup / uninstall helpers
+  • Pre/post build hooks
+  • Dependency report & environment snapshot
+  • On-the-fly progress subscription
+  • Extra PyInstaller flags passthrough
+  • One-click rebuild from manifest
+  • Dry-run mode
+
+Usage (Original – still works identically)
+-------------------------------------------
     import pyxwizard
 
     pyxwizard.begin()
-    pyxwizard.location("my_script.py")       # or "self" to package the calling script
+    pyxwizard.location("my_script.py")
     pyxwizard.name("MyProject")
-    pyxwizard.author("My Name")              # optional, default TRADELY.DEV
-    pyxwizard.console(True)                  # optional, default True
-    pyxwizard.icon("app.ico")               # optional, default Tradely icon
-    pyxwizard.data("assets", "config")       # optional, bundle folders into EXE
-    pyxwizard.cert("cert.pfx", "pass123")    # optional, code signing
-    pyxwizard.outlocation("C:/builds")       # where to create PyX_Data
     pyxwizard.build()
+
+Usage (New – step callbacks for a GUI)
+--------------------------------------
+    import pyxwizard
+
+    pyxwizard.begin()
+    pyxwizard.location("my_script.py")
+    pyxwizard.name("MyProject")
+    pyxwizard.feedback("step")                     # NEW: full/step/finish/none
+    pyxwizard.on_progress(my_progress_bar_func)   # NEW
+    pyxwizard.on_log(my_log_textbox_func)          # NEW
+    pyxwizard.on_step(my_step_indicator_func)       # NEW
+    pyxwizard.version("2.1.0")                     # NEW
+    pyxwizard.splash("splash.png", timeout=5)       # NEW
+    pyxwizard.extra_flags("--uac-admin")            # NEW
+    pyxwizard.hook_pre(my_pre_func)                 # NEW
+    pyxwizard.hook_post(my_post_func)               # NEW
+    result = pyxwizard.build()                      # returns BuildResult
+
+    # After build
+    pyxwizard.report()                              # print dependency report
+    snap = pyxwizard.snapshot()                      # environment snapshot dict
+    pyxwizard.clean("MyProject")                    # remove build artefacts
 """
 
 # =============================================================================
@@ -43,8 +73,11 @@ import urllib.request
 import urllib.error
 import inspect
 import time
+import hashlib
+import traceback
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Callable, Set, Tuple
+from typing import List, Optional, Dict, Any, Callable, Set, Tuple, Union
+from dataclasses import dataclass, field, asdict
 
 # =============================================================================
 # IMPORTS – Optional (cryptography for PFX validation)
@@ -59,12 +92,89 @@ except ImportError:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.9.1"
 DEFAULT_AUTHOR = "TRADELY.DEV"
 PYINSTALLER_FLAGS = ["--onefile", "--clean", "--noconfirm"]
 DEFAULT_ICON_URL = "https://doc.tradely.dev/images/tradely.ico"
 SIGNTOOL_RELATIVE_PATH = "signtool/signtool.exe"
 LIBRARIES_CATEGORY_FILE = "https://doc.tradely.dev/PyX/lib_categories.json"
+
+# =============================================================================
+# CONSTANTS – Build Step IDs (for callback identification)
+# =============================================================================
+STEP_INIT            = "init"
+STEP_PROJECT_DIRS    = "project_dirs"
+STEP_VENV            = "venv"
+STEP_PIP_UPGRADE     = "pip_upgrade"
+STEP_PYINSTALLER     = "pyinstaller_check"
+STEP_DEPENDENCIES    = "dependencies"
+STEP_PREPROCESS      = "preprocess"
+STEP_ICON            = "icon"
+STEP_VERSION_INFO    = "version_info"
+STEP_SPLASH          = "splash"
+STEP_PRE_HOOK        = "pre_hook"
+STEP_BUILD           = "build"
+STEP_LOCATE_EXE      = "locate_exe"
+STEP_SIGNING         = "signing"
+STEP_POST_HOOK       = "post_hook"
+STEP_MANIFEST        = "manifest"
+STEP_REPORT          = "report"
+STEP_LOG             = "log"
+STEP_COMPLETE        = "complete"
+
+ALL_STEPS = [
+    STEP_INIT, STEP_PROJECT_DIRS, STEP_VENV, STEP_PIP_UPGRADE,
+    STEP_PYINSTALLER, STEP_DEPENDENCIES, STEP_PREPROCESS,
+    STEP_ICON, STEP_VERSION_INFO, STEP_SPLASH, STEP_PRE_HOOK,
+    STEP_BUILD, STEP_LOCATE_EXE, STEP_SIGNING, STEP_POST_HOOK,
+    STEP_MANIFEST, STEP_REPORT, STEP_LOG, STEP_COMPLETE,
+]
+
+# Human-readable labels for each step
+STEP_LABELS = {
+    STEP_INIT:          "Initialising build",
+    STEP_PROJECT_DIRS:  "Creating project structure",
+    STEP_VENV:          "Setting up virtual environment",
+    STEP_PIP_UPGRADE:   "Upgrading pip",
+    STEP_PYINSTALLER:   "Checking PyInstaller",
+    STEP_DEPENDENCIES:  "Installing dependencies",
+    STEP_PREPROCESS:    "Preprocessing script",
+    STEP_ICON:          "Resolving icon",
+    STEP_VERSION_INFO:  "Embedding version info",
+    STEP_SPLASH:        "Configuring splash screen",
+    STEP_PRE_HOOK:      "Running pre-build hook",
+    STEP_BUILD:         "Running PyInstaller",
+    STEP_LOCATE_EXE:    "Locating executable",
+    STEP_SIGNING:       "Code signing",
+    STEP_POST_HOOK:     "Running post-build hook",
+    STEP_MANIFEST:      "Writing manifest",
+    STEP_REPORT:        "Generating dependency report",
+    STEP_LOG:           "Saving build log",
+    STEP_COMPLETE:      "Build complete",
+}
+
+# Progress values for each step (0.0 – 1.0)
+STEP_PROGRESS = {
+    STEP_INIT:          0.02,
+    STEP_PROJECT_DIRS:  0.05,
+    STEP_VENV:          0.15,
+    STEP_PIP_UPGRADE:   0.22,
+    STEP_PYINSTALLER:   0.30,
+    STEP_DEPENDENCIES:  0.42,
+    STEP_PREPROCESS:    0.50,
+    STEP_ICON:          0.53,
+    STEP_VERSION_INFO:  0.55,
+    STEP_SPLASH:        0.57,
+    STEP_PRE_HOOK:      0.58,
+    STEP_BUILD:         0.80,
+    STEP_LOCATE_EXE:    0.85,
+    STEP_SIGNING:       0.90,
+    STEP_POST_HOOK:     0.92,
+    STEP_MANIFEST:      0.94,
+    STEP_REPORT:        0.96,
+    STEP_LOG:           0.98,
+    STEP_COMPLETE:      1.00,
+}
 
 # =============================================================================
 # GLOBALS – Fetched Library Data
@@ -172,6 +282,95 @@ else:
 
 
 # =============================================================================
+# DATA CLASSES – Build Results & Dependency Info
+# =============================================================================
+@dataclass
+class DependencyInfo:
+    """Information about a single detected dependency."""
+    name: str
+    category: Optional[str] = None
+    pip_name: Optional[str] = None
+    installed: bool = False
+    install_error: Optional[str] = None
+
+
+@dataclass
+class StepResult:
+    """Result of a single build step."""
+    step_id: str
+    label: str
+    success: bool
+    duration_seconds: float = 0.0
+    message: str = ""
+    skipped: bool = False
+
+
+@dataclass
+class BuildResult:
+    """
+    Comprehensive result object returned by pyxwizard.build().
+    Provides everything a GUI or caller needs to display results.
+    """
+    success: bool = False
+    exe_path: Optional[Path] = None
+    exe_size_bytes: int = 0
+    exe_size_mb: float = 0.0
+    signed: bool = False
+    project_dir: Optional[Path] = None
+    dist_dir: Optional[Path] = None
+    log_dir: Optional[Path] = None
+    manifest_path: Optional[Path] = None
+    report_path: Optional[Path] = None
+    build_duration_seconds: float = 0.0
+    project_name: str = ""
+    author: str = ""
+    script_path: Optional[Path] = None
+    console_mode: bool = True
+    icon_used: Optional[str] = None
+    version_string: Optional[str] = None
+    data_folders_count: int = 0
+    data_total_size_mb: float = 0.0
+    dependencies: List[DependencyInfo] = field(default_factory=list)
+    step_results: List[StepResult] = field(default_factory=list)
+    error_message: Optional[str] = None
+    error_traceback: Optional[str] = None
+    log_lines: List[str] = field(default_factory=list)
+    pyx_version: str = APP_VERSION
+    python_version: str = ""
+    platform_info: str = ""
+    script_hash: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise to a dictionary (paths become strings)."""
+        d = asdict(self)
+        for key in ["exe_path", "project_dir", "dist_dir", "log_dir",
+                     "manifest_path", "report_path", "script_path"]:
+            if d.get(key) is not None:
+                d[key] = str(d[key])
+        return d
+
+    def to_json(self, indent: int = 4) -> str:
+        """Serialise to JSON."""
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+    def summary(self) -> str:
+        """Return a human-readable summary string."""
+        lines = []
+        status = "SUCCESS" if self.success else "FAILED"
+        lines.append(f"Build {status}: {self.project_name}")
+        lines.append(f"  Duration: {self.build_duration_seconds:.1f}s")
+        if self.exe_path:
+            lines.append(f"  Executable: {self.exe_path}")
+            lines.append(f"  Size: {self.exe_size_mb:.1f} MB")
+        lines.append(f"  Signed: {'Yes' if self.signed else 'No'}")
+        lines.append(f"  Dependencies: {len(self.dependencies)}")
+        if self.error_message:
+            lines.append(f"  Error: {self.error_message}")
+        lines.append(f"  Steps completed: {sum(1 for s in self.step_results if s.success)}/{len(self.step_results)}")
+        return "\n".join(lines)
+
+
+# =============================================================================
 # TERMINAL OUTPUT HELPERS
 # =============================================================================
 class _TermStyle:
@@ -220,32 +419,21 @@ def _header(text: str) -> None:
 
 
 def _info(msg: str) -> None:
-    """Print an info message."""
     print(f"  {_TermStyle.GREEN}●{_TermStyle.RESET}  {msg}")
 
-
 def _warn(msg: str) -> None:
-    """Print a warning message."""
     print(f"  {_TermStyle.YELLOW}⚠{_TermStyle.RESET}  {_TermStyle.YELLOW}{msg}{_TermStyle.RESET}")
 
-
 def _error(msg: str) -> None:
-    """Print an error message."""
     print(f"  {_TermStyle.RED}✕{_TermStyle.RESET}  {_TermStyle.RED}{msg}{_TermStyle.RESET}")
 
-
 def _success(msg: str) -> None:
-    """Print a success message."""
     print(f"  {_TermStyle.GREEN}✓{_TermStyle.RESET}  {_TermStyle.GREEN}{msg}{_TermStyle.RESET}")
 
-
 def _detail(msg: str) -> None:
-    """Print a detail/subprocess line."""
     print(f"  {_TermStyle.GREY}   {msg}{_TermStyle.RESET}")
 
-
 def _progress_bar(label: str, current: float, total: float = 1.0, width: int = 40) -> None:
-    """Print a progress bar."""
     S = _TermStyle
     ratio = min(current / total, 1.0) if total > 0 else 0
     filled = int(width * ratio)
@@ -257,7 +445,7 @@ def _progress_bar(label: str, current: float, total: float = 1.0, width: int = 4
 
 
 # =============================================================================
-# CORE HELPER FUNCTIONS
+# CORE HELPER FUNCTIONS (unchanged from v1 – backwards compatible)
 # =============================================================================
 def _resolve_packaged_path_local(relative_path: str) -> Path:
     """Resolve a path to a resource bundled alongside this script or frozen exe."""
@@ -310,7 +498,6 @@ def _fetch_lib_categories() -> bool:
 
 
 def _get_category(lib_name: str) -> Optional[str]:
-    """Return the category for *lib_name* if known, else None."""
     return _lib_categories.get(lib_name.lower())
 
 
@@ -342,7 +529,6 @@ def detect_script_imports(script_path: Path) -> List[str]:
             continue
         if name.lower() == "pyinstaller":
             continue
-        # Exclude pyxwizard itself to avoid self-referencing
         if name.lower() == "pyxwizard":
             continue
         sanitised.append(name)
@@ -382,15 +568,13 @@ def write_build_log(project_dir: Path, log_lines: List[str]) -> None:
 
 
 def validate_pfx(pfx_path: Path, password: str) -> bool:
-    """Validate a PFX/P12 certificate file using the cryptography library."""
+    """Validate a PFX/P12 certificate file."""
     if not CRYPTOGRAPHY_AVAILABLE:
         return False
     try:
         pfx_data = pfx_path.read_bytes()
         pkcs12.load_key_and_certificates(
-            pfx_data,
-            password.encode("utf-8"),
-            default_backend()
+            pfx_data, password.encode("utf-8"), default_backend()
         )
         return True
     except Exception:
@@ -426,9 +610,7 @@ def run_cmd(
     process.wait()
     if process.returncode != 0:
         raise subprocess.CalledProcessError(
-            process.returncode,
-            cmd,
-            output="\n".join(output_lines)
+            process.returncode, cmd, output="\n".join(output_lines)
         )
 
 
@@ -461,9 +643,7 @@ def create_project_venv(project_dir: Path, log: Callable[[str], None]) -> Path:
 
 
 def venv_pip_install(
-    python_exe: Path,
-    *packages: str,
-    log: Callable[[str], None]
+    python_exe: Path, *packages: str, log: Callable[[str], None]
 ) -> None:
     """Install packages using pip inside the virtual environment."""
     if not packages:
@@ -480,10 +660,8 @@ def venv_has_package(python_exe: Path, package: str) -> bool:
             creation_flags = subprocess.CREATE_NO_WINDOW
         result = subprocess.run(
             [str(python_exe), "-c", f"import {package}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            creationflags=creation_flags
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30, creationflags=creation_flags
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -491,39 +669,50 @@ def venv_has_package(python_exe: Path, package: str) -> bool:
 
 
 def install_script_deps(
-    python_exe: Path,
-    script_path: Path,
-    log: Callable[[str], None]
-) -> None:
-    """Detect and install third-party imports into the virtual environment."""
+    python_exe: Path, script_path: Path, log: Callable[[str], None]
+) -> List[DependencyInfo]:
+    """
+    Detect and install third-party imports into the virtual environment.
+    Returns a list of DependencyInfo for each dependency (NEW in v2).
+    """
     detected_imports = detect_script_imports(script_path)
+    dep_results: List[DependencyInfo] = []
+
     if not detected_imports:
         log("No third-party dependencies detected.")
-        return
+        return dep_results
 
     log(f"Detected third-party imports: {', '.join(detected_imports)}")
 
     for package_name in detected_imports:
+        dep = DependencyInfo(
+            name=package_name,
+            category=_get_category(package_name),
+            pip_name=_lib_copy_metadata.get(package_name, package_name),
+        )
         if venv_has_package(python_exe, package_name):
             log(f"  Package '{package_name}' is already installed.")
+            dep.installed = True
         else:
-            pip_name = _lib_copy_metadata.get(package_name, package_name)
+            pip_name = dep.pip_name or package_name
             log(f"  Installing '{pip_name}'...")
             try:
                 venv_pip_install(python_exe, pip_name, log=log)
+                dep.installed = True
             except subprocess.CalledProcessError as install_error:
                 log(
                     f"  WARNING: Failed to install '{pip_name}'. "
                     f"It may be a local module or have a different pip name. "
                     f"Error: {install_error}"
                 )
+                dep.install_error = str(install_error)
+        dep_results.append(dep)
+
+    return dep_results
 
 
 def sign_exe(
-    exe: Path,
-    pfx: Path,
-    pwd: str,
-    log: Callable[[str], None],
+    exe: Path, pfx: Path, pwd: str, log: Callable[[str], None],
     signtool_path_override: Optional[str] = None
 ) -> None:
     """Sign the built executable using signtool.exe."""
@@ -537,10 +726,8 @@ def sign_exe(
         return
 
     cmd = [
-        str(signtool_path),
-        "sign",
-        "/f", str(pfx),
-        "/p", pwd,
+        str(signtool_path), "sign",
+        "/f", str(pfx), "/p", pwd,
         "/fd", "SHA256",
         "/tr", "http://timestamp.digicert.com",
         "/td", "SHA256",
@@ -614,21 +801,15 @@ def preprocess_script(script_path: Path, temp_dir: Path) -> Path:
 
 
 def _strip_pyxwizard_from_script(script_path: Path, temp_dir: Path) -> Path:
-    """
-    For 'self' mode: copy the calling script but remove all pyxwizard
-    import lines and pyxwizard.xxx() calls so the packaged EXE doesn't
-    depend on this library.
-    """
+    """For 'self' mode: remove all pyxwizard references from the script."""
     source = script_path.read_text(encoding="utf-8", errors="replace")
     lines = source.split("\n")
     cleaned: List[str] = []
 
     for line in lines:
         stripped = line.strip()
-        # Remove import pyxwizard / from pyxwizard import ...
         if re.match(r'^(import\s+pyxwizard|from\s+pyxwizard\s+import)', stripped, re.IGNORECASE):
             continue
-        # Remove pyxwizard.xxx(...) calls (any casing)
         if re.match(r'^pyxwizard\.\w+\s*\(', stripped, re.IGNORECASE):
             continue
         cleaned.append(line)
@@ -647,7 +828,201 @@ def count_existing_projects(base_dir: Path) -> int:
 
 
 # =============================================================================
-# PyX WIZARD CLASS – The Library Interface
+# NEW v2 HELPER – Version Info File Generation (Windows EXE properties)
+# =============================================================================
+def _generate_version_info(
+    version_str: str,
+    project_name: str,
+    author: str,
+    description: str = "",
+    output_path: Optional[Path] = None
+) -> Optional[Path]:
+    """
+    Generate a PyInstaller-compatible version info file that embeds
+    File Version, Product Name, Company Name, etc. into the EXE
+    properties (right-click → Properties → Details on Windows).
+
+    Parameters
+    ----------
+    version_str : str
+        A version string like "1.2.3" or "2.0.0.1".
+    project_name : str
+        Used as ProductName and InternalName.
+    author : str
+        Used as CompanyName and LegalCopyright.
+    description : str
+        Used as FileDescription.
+    output_path : Path, optional
+        Where to write the version file.  If None, a temp file is created.
+
+    Returns
+    -------
+    Path or None
+        The path to the generated .py version file, or None on error.
+    """
+    parts = version_str.replace("-", ".").split(".")
+    while len(parts) < 4:
+        parts.append("0")
+    numeric = []
+    for p in parts[:4]:
+        digits = re.sub(r'[^0-9]', '', p)
+        numeric.append(int(digits) if digits else 0)
+
+    ver_tuple = tuple(numeric)
+    ver_csv = ", ".join(str(v) for v in ver_tuple)
+
+    content = textwrap.dedent(f'''\
+# UTF-8
+# PyX Wizard auto-generated version info
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=({ver_csv}),
+    prodvers=({ver_csv}),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'040904B0',
+          [
+            StringStruct(u'CompanyName', u'{author}'),
+            StringStruct(u'FileDescription', u'{description or project_name}'),
+            StringStruct(u'FileVersion', u'{version_str}'),
+            StringStruct(u'InternalName', u'{project_name}'),
+            StringStruct(u'LegalCopyright', u'© {datetime.datetime.now().year} {author}'),
+            StringStruct(u'OriginalFilename', u'{project_name}.exe'),
+            StringStruct(u'ProductName', u'{project_name}'),
+            StringStruct(u'ProductVersion', u'{version_str}'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+''')
+    try:
+        if output_path is None:
+            output_path = Path(tempfile.mktemp(suffix="_version.py", prefix="pyx_"))
+        output_path.write_text(content, encoding="utf-8")
+        return output_path
+    except Exception:
+        return None
+
+
+# =============================================================================
+# NEW v2 HELPER – Dependency Report Writer
+# =============================================================================
+def _write_dependency_report(
+    project_dir: Path,
+    deps: List[DependencyInfo],
+    script_path: Path,
+    project_name: str,
+) -> Path:
+    """
+    Write a dependency_report.txt into the project directory showing
+    all detected imports, their categories, install status, and pip names.
+    """
+    report_path = project_dir / "dependency_report.txt"
+    lines = [
+        f"PyX Wizard – Dependency Report",
+        f"{'=' * 50}",
+        f"Project:  {project_name}",
+        f"Script:   {script_path}",
+        f"Date:     {datetime.datetime.now().isoformat()}",
+        f"",
+        f"{'Library':<25} {'Category':<18} {'Pip Name':<22} {'Status'}",
+        f"{'-' * 25} {'-' * 18} {'-' * 22} {'-' * 12}",
+    ]
+    for dep in deps:
+        cat = dep.category or "—"
+        pip = dep.pip_name or dep.name
+        if dep.installed:
+            status = "✓ Installed"
+        elif dep.install_error:
+            status = "✕ Failed"
+        else:
+            status = "? Unknown"
+        lines.append(f"{dep.name:<25} {cat:<18} {pip:<22} {status}")
+
+    if not deps:
+        lines.append("  (no third-party dependencies detected)")
+
+    lines.append("")
+    lines.append(f"Total: {len(deps)} dependencies, "
+                 f"{sum(1 for d in deps if d.installed)} installed, "
+                 f"{sum(1 for d in deps if d.install_error)} failed")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
+
+
+# =============================================================================
+# NEW v2 HELPER – Environment Snapshot
+# =============================================================================
+def _create_snapshot(
+    project_dir: Path,
+    python_exe: Path,
+    log: Callable[[str], None]
+) -> Dict[str, Any]:
+    """
+    Capture a snapshot of the virtual environment: installed packages,
+    Python version, platform, etc.  Saved as environment_snapshot.json.
+    """
+    snapshot: Dict[str, Any] = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python_sys": sys.version,
+        "packages": [],
+    }
+
+    # Get pip freeze from the venv
+    try:
+        creation_flags = 0
+        if platform.system() == "Windows":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            [str(python_exe), "-m", "pip", "freeze"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=30, creationflags=creation_flags
+        )
+        if result.returncode == 0:
+            snapshot["packages"] = [
+                line.strip() for line in result.stdout.strip().split("\n")
+                if line.strip()
+            ]
+    except Exception as e:
+        log(f"WARNING: Could not capture pip freeze: {e}")
+
+    snapshot_path = project_dir / "environment_snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(snapshot, indent=4, default=str), encoding="utf-8"
+    )
+
+    return snapshot
+
+
+# =============================================================================
+# NEW v2 HELPER – File Hash
+# =============================================================================
+def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# =============================================================================
+# PyX WIZARD CLASS – The Library Interface (v2 with callbacks)
 # =============================================================================
 class _PyXWizard:
     """
@@ -672,6 +1047,20 @@ class _PyXWizard:
         self._detected_imports: List[str] = []
         self._lib_fetch_done = False
 
+        # --- NEW v2 state ---
+        self._version_string: Optional[str] = None
+        self._description: str = ""
+        self._splash_image: Optional[str] = None
+        self._splash_timeout: int = 5
+        self._extra_flags: List[str] = []
+        self._hook_pre_fn: Optional[Callable[[], None]] = None
+        self._hook_post_fn: Optional[Callable[[BuildResult], None]] = None
+        self._on_progress_fn: Optional[Callable[[float, str], None]] = None
+        self._on_log_fn: Optional[Callable[[str], None]] = None
+        self._on_step_fn: Optional[Callable[[str, str, float], None]] = None
+        self._dry_run: bool = False
+        self._feedback_mode: str = "full"  # "full", "step", "finish", "none"
+
     def _reset(self) -> None:
         """Reset all state for a fresh configuration."""
         self._script_path = None
@@ -688,46 +1077,105 @@ class _PyXWizard:
         self._log_lines = []
         self._detected_imports = []
 
+        # Reset v2 state
+        self._version_string = None
+        self._description = ""
+        self._splash_image = None
+        self._splash_timeout = 5
+        self._extra_flags = []
+        self._hook_pre_fn = None
+        self._hook_post_fn = None
+        self._on_progress_fn = None
+        self._on_log_fn = None
+        self._on_step_fn = None
+        self._dry_run = False
+        self._feedback_mode = "full"
+
     def _log(self, message: str) -> None:
-        """Log a message to both terminal and internal buffer."""
+        """Log a message to internal buffer, terminal (if full), and external callback."""
         self._log_lines.append(message)
-        _detail(message)
+        if self._feedback_mode == "full":
+            _detail(message)
+        if self._on_log_fn is not None:
+            try:
+                self._on_log_fn(message)
+            except Exception:
+                pass
+
+    def _emit_progress(self, value: float, label: str) -> None:
+        """Emit progress to terminal (if full) and callback."""
+        if self._feedback_mode == "full":
+            _progress_bar(label, value)
+        if self._on_progress_fn is not None:
+            try:
+                self._on_progress_fn(value, label)
+            except Exception:
+                pass
+
+    def _emit_step(self, step_id: str) -> None:
+        """Emit a step change to terminal (if full or step) and callback."""
+        label = STEP_LABELS.get(step_id, step_id)
+        progress = STEP_PROGRESS.get(step_id, 0.0)
+        if self._feedback_mode in ("full", "step"):
+            _header(label.upper())
+        if self._on_step_fn is not None:
+            try:
+                self._on_step_fn(step_id, label, progress)
+            except Exception:
+                pass
+
+    # Shorthand feedback-level checks used throughout the class
+    def _fb_full(self) -> bool:
+        """True when full terminal output is enabled."""
+        return self._feedback_mode == "full"
+
+    def _fb_any(self) -> bool:
+        """True when any terminal output is enabled (full, step, or finish)."""
+        return self._feedback_mode != "none"
+
+    def _fb_step(self) -> bool:
+        """True when step-level or full output is enabled."""
+        return self._feedback_mode in ("full", "step")
+
+    def _fb_finish(self) -> bool:
+        """True when at least finish-level output is enabled."""
+        return self._feedback_mode in ("full", "step", "finish")
 
     def _get_base_dir(self) -> Path:
-        """Return the base directory for PyX_Data output."""
         if self._out_location is not None:
             return self._out_location
         if getattr(sys, "frozen", False):
             return Path(sys.executable).parent
-        # Default: directory of the calling script, or CWD
         if self._script_path:
             return self._script_path.parent
         return Path.cwd()
 
     # -------------------------------------------------------------------------
-    # PUBLIC API METHODS
+    # PUBLIC API METHODS (v1 – unchanged signatures)
     # -------------------------------------------------------------------------
-
     def begin(self) -> None:
         """Initialise PyX Wizard. Must be called first."""
         self._reset()
         self._initialised = True
-        _banner()
-        _info("PyX Wizard initialised.")
-        _info(f"Platform: {platform.system()} {platform.machine()}")
-        _info(f"Python: {sys.version.split()[0]}")
-        _info(f"Default author: {self._author}")
+        if self._fb_full():
+            _banner()
+            _info("PyX Wizard initialised.")
+            _info(f"Platform: {platform.system()} {platform.machine()}")
+            _info(f"Python: {sys.version.split()[0]}")
+            _info(f"Default author: {self._author}")
 
-        # Fetch library categories in background
         if not self._lib_fetch_done:
-            _info("Fetching library categories from remote...")
+            if self._fb_full():
+                _info("Fetching library categories from remote...")
             success = _fetch_lib_categories()
             self._lib_fetch_done = True
             if success:
                 cat_count = len(_lib_categories)
-                _success(f"Library categories loaded ({cat_count} libraries catalogued).")
+                if self._fb_full():
+                    _success(f"Library categories loaded ({cat_count} libraries catalogued).")
             else:
-                _warn("Could not fetch library categories (no internet?). Build will continue without categorisation.")
+                if self._fb_full():
+                    _warn("Could not fetch library categories (no internet?). Build will continue without categorisation.")
 
     def location(self, script_path: str) -> None:
         """Set the Python script to package."""
@@ -735,11 +1183,10 @@ class _PyXWizard:
             _error("pyxwizard.begin() must be called before pyxwizard.location().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
 
-        _header("SCRIPT LOCATION")
+        if self._fb_full():
+            _header("SCRIPT LOCATION")
 
         if script_path.lower() == "self":
-            # Package the calling script — walk the stack to find the first
-            # frame that is outside this module (skips the module-level wrapper).
             _this_file = os.path.abspath(__file__)
             caller_file = None
             for _frame in inspect.stack():
@@ -749,9 +1196,10 @@ class _PyXWizard:
             if caller_file and os.path.isfile(caller_file):
                 self._script_path = Path(caller_file).resolve()
                 self._self_mode = True
-                _info(f'Mode: "self" — packaging the calling script.')
-                _info(f"Script: {self._script_path}")
-                _info("pyxwizard commands will be stripped from the packaged copy.")
+                if self._fb_full():
+                    _info(f'Mode: "self" — packaging the calling script.')
+                    _info(f"Script: {self._script_path}")
+                    _info("pyxwizard commands will be stripped from the packaged copy.")
             else:
                 _error(f"Could not resolve calling script path: {caller_file}")
                 raise FileNotFoundError(f"Cannot resolve 'self' to a script file: {caller_file}")
@@ -761,24 +1209,26 @@ class _PyXWizard:
                 _error(f"Script not found: {resolved}")
                 raise FileNotFoundError(f"Script not found: {resolved}")
             if not resolved.suffix == ".py":
-                _warn(f"File does not have .py extension: {resolved}")
+                if self._fb_full():
+                    _warn(f"File does not have .py extension: {resolved}")
             self._script_path = resolved
             self._self_mode = False
-            _info(f"Script: {self._script_path}")
+            if self._fb_full():
+                _info(f"Script: {self._script_path}")
 
-        # Detect imports
         self._detected_imports = detect_script_imports(self._script_path)
-        if self._detected_imports:
-            _info(f"Detected {len(self._detected_imports)} third-party import(s):")
-            for imp in self._detected_imports:
-                cat = _get_category(imp)
-                cat_str = f"  [{cat}]" if cat else ""
-                _detail(f"  • {imp}{cat_str}")
-        else:
-            _info("No third-party imports detected (standard library only).")
+        if self._fb_full():
+            if self._detected_imports:
+                _info(f"Detected {len(self._detected_imports)} third-party import(s):")
+                for imp in self._detected_imports:
+                    cat = _get_category(imp)
+                    cat_str = f"  [{cat}]" if cat else ""
+                    _detail(f"  • {imp}{cat_str}")
+            else:
+                _info("No third-party imports detected (standard library only).")
 
-        file_size = self._script_path.stat().st_size
-        _info(f"Script size: {file_size:,} bytes")
+            file_size = self._script_path.stat().st_size
+            _info(f"Script size: {file_size:,} bytes")
 
     def name(self, project_name: str) -> None:
         """Set the project/executable name."""
@@ -786,7 +1236,8 @@ class _PyXWizard:
             _error("pyxwizard.begin() must be called before pyxwizard.name().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
 
-        _header("PROJECT NAME")
+        if self._fb_full():
+            _header("PROJECT NAME")
 
         sanitised = re.sub(r'[^\w\-.]', '_', project_name.strip())
         if not sanitised:
@@ -794,548 +1245,761 @@ class _PyXWizard:
             raise ValueError(f"Invalid project name: '{project_name}'")
 
         self._project_name = sanitised
-        _info(f"Project name: {self._project_name}")
-
-        if sanitised != project_name.strip():
-            _warn(f"Name sanitised from '{project_name}' to '{sanitised}'")
-
-        base_dir = self._get_base_dir()
-        project_dir = base_dir / "PyX_Data" / sanitised
-        _info(f"Output directory: {project_dir}")
-
-        if project_dir.exists():
-            _warn("Project directory already exists. Cleaned script will be overwritten; virtual environment will be reused.")
-
-        existing = count_existing_projects(base_dir)
-        _info(f"Existing projects in PyX_Data: {existing}")
+        if self._fb_full():
+            _info(f"Project name: {self._project_name}")
+            if sanitised != project_name.strip():
+                _warn(f"Name sanitised from '{project_name}' to '{sanitised}'")
+            base_dir = self._get_base_dir()
+            project_dir = base_dir / "PyX_Data" / sanitised
+            _info(f"Output directory: {project_dir}")
+            if project_dir.exists():
+                _warn("Project directory already exists. Cleaned script will be overwritten; virtual environment will be reused.")
+            existing = count_existing_projects(base_dir)
+            _info(f"Existing projects in PyX_Data: {existing}")
 
     def author(self, author_name: str) -> None:
-        """Set the author name (optional, default TRADELY.DEV)."""
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.author().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
-
         self._author = author_name.strip() if author_name.strip() else DEFAULT_AUTHOR
-        _header("AUTHOR")
-        _info(f"Author set to: {self._author}")
+        if self._fb_full():
+            _header("AUTHOR")
+            _info(f"Author set to: {self._author}")
 
     def console(self, enabled: bool = True) -> None:
-        """Set console mode (True = show console, False = GUI-only/windowed)."""
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.console().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
-
         self._console_mode = bool(enabled)
-        _header("CONSOLE MODE")
-        if self._console_mode:
-            _info("Console mode: ON (console window will be shown)")
-        else:
-            _info("Console mode: OFF (no console window — GUI/windowed mode)")
+        if self._fb_full():
+            _header("CONSOLE MODE")
+            if self._console_mode:
+                _info("Console mode: ON (console window will be shown)")
+            else:
+                _info("Console mode: OFF (no console window — GUI/windowed mode)")
 
     def icon(self, icon_path: str) -> None:
-        """Set a custom .ico icon for the executable."""
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.icon().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
-
-        _header("CUSTOM ICON")
-
+        if self._fb_full():
+            _header("CUSTOM ICON")
         resolved = Path(icon_path).resolve()
         if not resolved.exists():
             _error(f"Icon file not found: {resolved}")
             raise FileNotFoundError(f"Icon file not found: {resolved}")
         if resolved.suffix.lower() != ".ico":
-            _warn(f"Icon file is not .ico format: {resolved.suffix}")
-
+            if self._fb_full():
+                _warn(f"Icon file is not .ico format: {resolved.suffix}")
         self._icon_path = str(resolved)
-        _info(f"Custom icon: {self._icon_path}")
-        _info(f"Icon size: {resolved.stat().st_size:,} bytes")
+        if self._fb_full():
+            _info(f"Custom icon: {self._icon_path}")
+            _info(f"Icon size: {resolved.stat().st_size:,} bytes")
 
     def data(self, *folder_paths: str) -> None:
-        """Add data folders to bundle into the executable."""
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.data().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
-
-        _header("DATA FOLDERS")
-
+        if self._fb_full():
+            _header("DATA FOLDERS")
         if not folder_paths:
-            _info("No data folders specified.")
+            if self._fb_full():
+                _info("No data folders specified.")
             return
 
         total_bytes = 0
         for fp in folder_paths:
             resolved = Path(fp).resolve()
             if not resolved.exists():
-                _error(f"Data folder not found: {resolved}")
                 raise FileNotFoundError(f"Data folder not found: {resolved}")
             if not resolved.is_dir():
-                _error(f"Path is not a directory: {resolved}")
                 raise NotADirectoryError(f"Not a directory: {resolved}")
-
             size = folder_size(resolved)
             total_bytes += size
             size_mb = size / (1024 * 1024)
             self._data_folders.append(resolved)
-            marker = "  ⚠ (>50 MB — large!)" if size_mb > 50 else ""
-            _info(f"Added: {resolved}")
-            _detail(f"  → bundled as '{resolved.name}/' ({size_mb:.1f} MB){marker}")
+            if self._fb_full():
+                marker = "  ⚠ (>50 MB — large!)" if size_mb > 50 else ""
+                _info(f"Added: {resolved}")
+                _detail(f"  → bundled as '{resolved.name}/' ({size_mb:.1f} MB){marker}")
 
         total_mb = total_bytes / (1024 * 1024)
-        _info(f"Total data size: {total_mb:.1f} MB across {len(folder_paths)} folder(s)")
-
-        if total_mb > 100:
-            _warn("Total data exceeds 100 MB. The EXE may be very large.")
+        if self._fb_full():
+            _info(f"Total data size: {total_mb:.1f} MB across {len(folder_paths)} folder(s)")
+            if total_mb > 100:
+                _warn("Total data exceeds 100 MB. The EXE may be very large.")
 
     def cert(self, certificate_path: str, password: str, signtool_path: Optional[str] = None) -> None:
-        """Set a PFX/P12 certificate for code signing."""
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.cert().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
-
-        _header("CODE SIGNING CERTIFICATE")
-
+        if self._fb_full():
+            _header("CODE SIGNING CERTIFICATE")
         resolved = Path(certificate_path).resolve()
         if not resolved.exists():
-            _error(f"Certificate file not found: {resolved}")
             raise FileNotFoundError(f"Certificate not found: {resolved}")
-
         self._pfx_path = resolved
         self._pfx_password = password
-        _info(f"Certificate: {self._pfx_path}")
-
+        if self._fb_full():
+            _info(f"Certificate: {self._pfx_path}")
         if signtool_path:
             st = Path(signtool_path).resolve()
             if not st.exists():
-                _warn(f"signtool.exe not found at: {st}")
+                if self._fb_full():
+                    _warn(f"signtool.exe not found at: {st}")
             else:
-                _info(f"signtool.exe: {st}")
+                if self._fb_full():
+                    _info(f"signtool.exe: {st}")
             self._signtool_path = str(st)
-
-        # Validate if cryptography is available
         if CRYPTOGRAPHY_AVAILABLE:
-            _info("Validating certificate...")
+            if self._fb_full():
+                _info("Validating certificate...")
             if validate_pfx(self._pfx_path, self._pfx_password):
-                _success("Certificate validated successfully.")
+                if self._fb_full():
+                    _success("Certificate validated successfully.")
             else:
-                _error("Certificate validation failed (bad password or corrupted file).")
-                _warn("Signing will still be attempted during build.")
+                if self._fb_full():
+                    _error("Certificate validation failed (bad password or corrupted file).")
+                    _warn("Signing will still be attempted during build.")
         else:
-            _warn("'cryptography' package not installed — cannot pre-validate certificate.")
-            _info("Signing will be attempted during build regardless.")
+            if self._fb_full():
+                _warn("'cryptography' package not installed — cannot pre-validate certificate.")
 
     def outlocation(self, path: str) -> None:
-        """Set the output location where PyX_Data will be created."""
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.outlocation().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
-
-        _header("OUTPUT LOCATION")
-
+        if self._fb_full():
+            _header("OUTPUT LOCATION")
         resolved = Path(path).resolve()
         resolved.mkdir(parents=True, exist_ok=True)
         self._out_location = resolved
-        _info(f"Output base: {self._out_location}")
-        _info(f"PyX_Data will be created at: {self._out_location / 'PyX_Data'}")
+        if self._fb_full():
+            _info(f"Output base: {self._out_location}")
+            _info(f"PyX_Data will be created at: {self._out_location / 'PyX_Data'}")
 
-    def build(self) -> Optional[Path]:
+    # -------------------------------------------------------------------------
+    # NEW v2 PUBLIC API METHODS
+    # -------------------------------------------------------------------------
+    def version(self, version_str: str, description: str = "") -> None:
+        """Set a version string to embed in the EXE file properties (Windows)."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+        self._version_string = version_str.strip()
+        self._description = description.strip()
+        if self._fb_full():
+            _header("VERSION INFO")
+            _info(f"Version: {self._version_string}")
+            if self._description:
+                _info(f"Description: {self._description}")
+
+    def splash(self, image_path: str, timeout: int = 5) -> None:
+        """Configure a splash screen image shown during EXE startup."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+        resolved = Path(image_path).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Splash image not found: {resolved}")
+        self._splash_image = str(resolved)
+        self._splash_timeout = max(1, timeout)
+        if self._fb_full():
+            _header("SPLASH SCREEN")
+            _info(f"Splash image: {self._splash_image}")
+            _info(f"Timeout: {self._splash_timeout}s")
+
+    def extra_flags(self, *flags: str) -> None:
+        """Add extra PyInstaller CLI flags (e.g. '--uac-admin', '--debug all')."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+        self._extra_flags.extend(flags)
+        if self._fb_full():
+            _header("EXTRA FLAGS")
+            _info(f"Added: {' '.join(flags)}")
+
+    def hook_pre(self, fn: Callable[[], None]) -> None:
+        """Register a function to run just before PyInstaller executes."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+        self._hook_pre_fn = fn
+        if self._fb_full():
+            _info("Pre-build hook registered.")
+
+    def hook_post(self, fn: Callable) -> None:
+        """Register a function to run after a successful build.  Receives BuildResult."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+        self._hook_post_fn = fn
+        if self._fb_full():
+            _info("Post-build hook registered.")
+
+    def on_progress(self, fn: Callable[[float, str], None]) -> None:
+        """Subscribe to progress updates.  fn(value: 0.0–1.0, label: str)."""
+        self._on_progress_fn = fn
+
+    def on_log(self, fn: Callable[[str], None]) -> None:
+        """Subscribe to log messages.  fn(message: str)."""
+        self._on_log_fn = fn
+
+    def on_step(self, fn: Callable[[str, str, float], None]) -> None:
+        """Subscribe to step changes.  fn(step_id, label, progress)."""
+        self._on_step_fn = fn
+
+    def feedback(self, mode: str = "full") -> None:
         """
-        Execute the full build process. Returns the path to the built
-        executable on success, or None on failure.
+        Set the terminal output level.
+
+        Parameters
+        ----------
+        mode : str
+            One of:
+            - "full"   — all output: banner, headers, progress bars, per-line detail (default)
+            - "step"   — step headers and summary only, no per-line detail
+            - "finish" — only the final BUILD SUCCESSFUL / BUILD FAILED summary
+            - "none"   — no terminal output at all (callbacks still fire)
+        """
+        mode = mode.strip().lower()
+        if mode not in ("full", "step", "finish", "none"):
+            raise ValueError(
+                f"Invalid feedback mode '{mode}'. "
+                f"Must be one of: 'full', 'step', 'finish', 'none'."
+            )
+        self._feedback_mode = mode
+
+    def dry_run(self, enabled: bool = True) -> None:
+        """Enable dry-run mode – validates everything but skips PyInstaller."""
+        self._dry_run = bool(enabled)
+        if self._fb_full():
+            if enabled:
+                _info("Dry-run mode enabled — PyInstaller will be skipped.")
+            else:
+                _info("Dry-run mode disabled.")
+
+    # -------------------------------------------------------------------------
+    # BUILD (v2 – returns BuildResult, fires callbacks at each step)
+    # -------------------------------------------------------------------------
+    def build(self) -> Union[Optional[Path], "BuildResult"]:
+        """
+        Execute the full build process.
+
+        Returns
+        -------
+        BuildResult
+            A comprehensive result object.  For backwards compatibility,
+            BuildResult is truthy when success=True (so  ``if pyxwizard.build():``
+            still works) and has an ``exe_path`` attribute.
         """
         if not self._initialised:
-            _error("pyxwizard.begin() must be called before pyxwizard.build().")
             raise RuntimeError("pyxwizard.begin() must be called first.")
         if self._script_path is None:
-            _error("No script specified. Call pyxwizard.location() first.")
             raise RuntimeError("No script specified.")
         if self._project_name is None:
-            _error("No project name specified. Call pyxwizard.name() first.")
             raise RuntimeError("No project name specified.")
 
-        # =====================================================================
-        _header("BUILD STARTED")
-        # =====================================================================
+        result = BuildResult(
+            project_name=self._project_name,
+            author=self._author,
+            script_path=self._script_path,
+            console_mode=self._console_mode,
+            version_string=self._version_string,
+            data_folders_count=len(self._data_folders),
+            python_version=sys.version.split()[0],
+            platform_info=f"{platform.system()} {platform.machine()}",
+        )
+
+        # Script hash
+        try:
+            result.script_hash = _file_sha256(self._script_path)
+        except Exception:
+            pass
+
+        # Data size
+        total_data_bytes = sum(folder_size(f) for f in self._data_folders)
+        result.data_total_size_mb = total_data_bytes / (1024 * 1024)
+
+        self._emit_step(STEP_INIT)
         S = _TermStyle
-        print()
-        print(f"  {S.BOLD}{S.WHITE}Project:  {S.GREEN}{self._project_name}{S.RESET}")
-        print(f"  {S.BOLD}{S.WHITE}Script:   {S.RESET}{self._script_path}")
-        print(f"  {S.BOLD}{S.WHITE}Author:   {S.RESET}{self._author}")
-        print(f"  {S.BOLD}{S.WHITE}Console:  {S.RESET}{'Yes' if self._console_mode else 'No'}")
-        print(f"  {S.BOLD}{S.WHITE}Icon:     {S.RESET}{self._icon_path or '(default Tradely)'}")
-        print(f"  {S.BOLD}{S.WHITE}Data:     {S.RESET}{len(self._data_folders)} folder(s)")
-        print(f"  {S.BOLD}{S.WHITE}Signing:  {S.RESET}{'Yes' if self._pfx_path else 'No'}")
-        print()
+        if self._fb_full():
+            print()
+            print(f"  {S.BOLD}{S.WHITE}Project:  {S.GREEN}{self._project_name}{S.RESET}")
+            print(f"  {S.BOLD}{S.WHITE}Script:   {S.RESET}{self._script_path}")
+            print(f"  {S.BOLD}{S.WHITE}Author:   {S.RESET}{self._author}")
+            print(f"  {S.BOLD}{S.WHITE}Console:  {S.RESET}{'Yes' if self._console_mode else 'No'}")
+            print(f"  {S.BOLD}{S.WHITE}Icon:     {S.RESET}{self._icon_path or '(default Tradely)'}")
+            print(f"  {S.BOLD}{S.WHITE}Data:     {S.RESET}{len(self._data_folders)} folder(s)")
+            print(f"  {S.BOLD}{S.WHITE}Signing:  {S.RESET}{'Yes' if self._pfx_path else 'No'}")
+            if self._version_string:
+                print(f"  {S.BOLD}{S.WHITE}Version:  {S.RESET}{self._version_string}")
+            if self._splash_image:
+                print(f"  {S.BOLD}{S.WHITE}Splash:   {S.RESET}{self._splash_image}")
+            if self._extra_flags:
+                print(f"  {S.BOLD}{S.WHITE}Flags:    {S.RESET}{' '.join(self._extra_flags)}")
+            if self._dry_run:
+                print(f"  {S.BOLD}{S.YELLOW}DRY RUN{S.RESET}")
+            print()
 
         base_dir = self._get_base_dir()
         pyx_data_dir = base_dir / "PyX_Data"
         project_dir = pyx_data_dir / self._project_name
+        result.project_dir = project_dir
+        result.dist_dir = project_dir / "dist"
+        result.log_dir = project_dir / "logs"
+
         temp_dir: Optional[Path] = None
         signed = False
         build_start = time.time()
-
         self._log_lines = []
+        step_results: List[StepResult] = []
+        python_exe: Optional[Path] = None
+
+        def _do_step(step_id: str, fn: Callable[[], str]) -> StepResult:
+            """Run a step, time it, record the result."""
+            self._emit_step(step_id)
+            label = STEP_LABELS.get(step_id, step_id)
+            progress = STEP_PROGRESS.get(step_id, 0.0)
+            self._emit_progress(progress, label)
+            t0 = time.time()
+            try:
+                msg = fn()
+                sr = StepResult(step_id, label, True, time.time() - t0, msg or "")
+            except Exception as e:
+                sr = StepResult(step_id, label, False, time.time() - t0, str(e))
+                raise
+            finally:
+                step_results.append(sr)
+            return sr
 
         try:
-            # =================================================================
-            # STEP 1: Project structure
-            # =================================================================
-            _progress_bar("Creating project structure...", 0.05)
-            self._log(f"=== PyX Wizard v{APP_VERSION} Build Started ===")
-            self._log(f"Project: {self._project_name}")
-            self._log(f"Script: {self._script_path}")
-            self._log(f"Author: {self._author}")
-            self._log(f"Timestamp: {datetime.datetime.now().isoformat()}")
-            self._log("")
-
-            for subfolder_name in ["venv", "build", "dist", "logs"]:
-                subfolder = project_dir / subfolder_name
-                subfolder.mkdir(parents=True, exist_ok=True)
-                self._log(f"Ensured directory: {subfolder}")
-
-            _progress_bar("Project structure created", 0.10)
-
-            # =================================================================
-            # STEP 2: Virtual environment
-            # =================================================================
-            _header("VIRTUAL ENVIRONMENT")
-            _progress_bar("Setting up virtual environment...", 0.12)
-            self._log("")
-            self._log("--- Virtual Environment ---")
-            python_exe = create_project_venv(project_dir, self._log)
-            _success(f"Virtual environment ready: {python_exe}")
-            _progress_bar("Virtual environment ready", 0.20)
-
-            # =================================================================
-            # STEP 3: Upgrade pip
-            # =================================================================
-            _header("UPGRADING PIP")
-            _progress_bar("Upgrading pip...", 0.22)
-            self._log("")
-            self._log("--- Upgrading pip ---")
-            try:
-                run_cmd(
-                    [str(python_exe), "-m", "pip", "install", "--upgrade", "pip"],
-                    self._log
-                )
-                _success("pip upgraded.")
-            except subprocess.CalledProcessError as pip_error:
-                self._log(f"WARNING: pip upgrade failed: {pip_error}")
-                _warn(f"pip upgrade failed: {pip_error}")
-            _progress_bar("pip ready", 0.25)
-
-            # =================================================================
-            # STEP 4: PyInstaller
-            # =================================================================
-            _header("PYINSTALLER CHECK")
-            _progress_bar("Checking PyInstaller...", 0.28)
-            self._log("")
-            self._log("--- PyInstaller ---")
-            if not venv_has_package(python_exe, "PyInstaller"):
-                _info("PyInstaller not found. Installing...")
-                self._log("PyInstaller not found in venv. Installing...")
-                venv_pip_install(python_exe, "pyinstaller", log=self._log)
-                _success("PyInstaller installed.")
-            else:
-                self._log("PyInstaller is already installed.")
-                _success("PyInstaller already installed.")
-            _progress_bar("PyInstaller ready", 0.35)
-
-            # =================================================================
-            # STEP 5: Dependencies
-            # =================================================================
-            _header("DEPENDENCIES")
-            _progress_bar("Installing dependencies...", 0.38)
-            self._log("")
-            self._log("--- Dependencies ---")
-            install_script_deps(python_exe, self._script_path, self._log)
-            _success("Dependencies resolved.")
-            _progress_bar("Dependencies installed", 0.45)
-
-            # =================================================================
-            # STEP 6: Preprocess script
-            # =================================================================
-            _header("SCRIPT PREPROCESSING")
-            _progress_bar("Preprocessing script...", 0.48)
-            self._log("")
-            self._log("--- Script Preprocessing ---")
-            temp_dir = Path(tempfile.mkdtemp(prefix="pyx_build_"))
-
-            if self._self_mode:
-                # Strip pyxwizard commands first, then preprocess
-                _info("Stripping pyxwizard commands from self-referencing script...")
-                self._log("Stripping pyxwizard library calls from script (self mode)...")
-                stripped_script = _strip_pyxwizard_from_script(self._script_path, temp_dir)
-                # Save the cleaned script into the PyX_Data project folder,
-                # overwriting any previous copy so stale files are never reused.
-                cleaned_in_project = project_dir / self._script_path.name
-                cleaned_in_project.write_text(
-                    stripped_script.read_text(encoding="utf-8"), encoding="utf-8"
-                )
-                self._log(f"Cleaned script written to: {cleaned_in_project}")
-                _info(f"Cleaned script saved → {cleaned_in_project}")
-                preprocessed_script = preprocess_script(stripped_script, temp_dir)
-            else:
-                preprocessed_script = preprocess_script(self._script_path, temp_dir)
-
-            self._log(f"Preprocessed script: {preprocessed_script}")
-            _success(f"Script preprocessed → {preprocessed_script.name}")
-            _progress_bar("Script preprocessed", 0.50)
-
-            # =================================================================
-            # STEP 7: Icon
-            # =================================================================
-            effective_icon: Optional[str] = self._icon_path
-            if effective_icon is None or not Path(effective_icon).exists():
-                _header("ICON")
-                _info("No custom icon. Downloading default...")
+            # STEP: Project structure
+            def _step_project_dirs():
+                self._log(f"=== PyX Wizard v{APP_VERSION} Build Started ===")
+                self._log(f"Project: {self._project_name}")
+                self._log(f"Script: {self._script_path}")
+                self._log(f"Author: {self._author}")
+                self._log(f"Timestamp: {datetime.datetime.now().isoformat()}")
                 self._log("")
-                self._log("--- Icon ---")
-                self._log("No custom icon provided. Downloading default icon...")
-                effective_icon = _download_icon(base_dir)
-                if effective_icon:
-                    self._log(f"Default icon: {effective_icon}")
-                    _success(f"Default icon ready: {effective_icon}")
-                else:
-                    self._log("WARNING: Could not download default icon.")
-                    _warn("Building without icon.")
+                for subfolder_name in ["venv", "build", "dist", "logs"]:
+                    subfolder = project_dir / subfolder_name
+                    subfolder.mkdir(parents=True, exist_ok=True)
+                    self._log(f"Ensured directory: {subfolder}")
+                return "Project structure created"
+            _do_step(STEP_PROJECT_DIRS, _step_project_dirs)
 
-            # =================================================================
-            # STEP 8: PyInstaller build
-            # =================================================================
-            _header("PYINSTALLER BUILD")
-            _progress_bar("Running PyInstaller...", 0.55)
-            self._log("")
-            self._log("--- PyInstaller Build ---")
-
-            pyinstaller_cmd: List[str] = [
-                str(python_exe), "-m", "PyInstaller"
-            ]
-            pyinstaller_cmd.extend(PYINSTALLER_FLAGS)
-            pyinstaller_cmd.extend(["--name", self._project_name])
-            pyinstaller_cmd.extend(["--distpath", str(project_dir / "dist")])
-            pyinstaller_cmd.extend(["--workpath", str(project_dir / "build")])
-
-            if not self._console_mode:
-                pyinstaller_cmd.append("--noconsole")
-
-            if effective_icon and Path(effective_icon).exists():
-                pyinstaller_cmd.extend(["--icon", effective_icon])
-
-            # Hidden imports (sanitised)
-            detected_imports = self._detected_imports
-            for import_name in detected_imports:
-                top_level = import_name.split(".")[0]
-                if top_level.isidentifier() and top_level.lower() != "pyinstaller":
-                    pyinstaller_cmd.extend(["--hidden-import", top_level])
-
-            # Collect-all for packages with dynamic imports
-            _COLLECT_ALL_PACKAGES: Set[str] = {
-                "OpenGL", "glfw", "moderngl", "vispy", "pyglet",
-                "pygame", "wx", "PyQt5", "PyQt6", "PySide2", "PySide6", "kivy",
-                "PIL", "cv2", "imageio", "skimage",
-                "sklearn", "scipy", "matplotlib", "numba", "shapely",
-                "cryptography", "cffi", "nacl",
-                "pkg_resources", "importlib_resources", "importlib_metadata",
-            }
-            if _lib_collect_all:
-                _COLLECT_ALL_PACKAGES |= _lib_collect_all
-
-            collected_tops = {imp.split(".")[0] for imp in detected_imports}
-
-            for pkg in _COLLECT_ALL_PACKAGES:
-                if pkg in collected_tops:
-                    pyinstaller_cmd.extend(["--collect-all", pkg])
-                    self._log(f"collect-all: {pkg}")
-
-            for pkg, hidden_list in _lib_hidden_imports.items():
-                if pkg in collected_tops:
-                    for hi in hidden_list:
-                        pyinstaller_cmd.extend(["--hidden-import", hi])
-                    self._log(f"hidden-imports ({pkg}): {', '.join(hidden_list)}")
-
-            for imp_name, dist_name in _lib_copy_metadata.items():
-                if imp_name in collected_tops:
-                    pyinstaller_cmd.extend(["--copy-metadata", dist_name])
-                    self._log(f"copy-metadata: {dist_name}")
-
-            # Data folders
-            separator = ";" if platform.system() == "Windows" else ":"
-            for data_folder in self._data_folders:
-                dest_name = data_folder.name
-                add_data_arg = f"{data_folder}{separator}{dest_name}"
-                pyinstaller_cmd.extend(["--add-data", add_data_arg])
-                self._log(f"add-data: {add_data_arg}")
-
-            pyinstaller_cmd.append(str(preprocessed_script))
-
-            self._log(f"Command: {' '.join(str(c) for c in pyinstaller_cmd)}")
-            self._log("")
-
-            _info("PyInstaller command assembled. Building...")
-
-            try:
-                run_cmd(pyinstaller_cmd, self._log, cwd=str(project_dir))
-            except subprocess.CalledProcessError:
-                self._log("WARNING: PyInstaller failed with uppercase. Trying lowercase...")
-                _warn("Retrying with lowercase module name...")
-                pyinstaller_cmd_retry = [
-                    str(python_exe), "-m", "pyinstaller"
-                ] + pyinstaller_cmd[3:]
-                run_cmd(pyinstaller_cmd_retry, self._log, cwd=str(project_dir))
-
-            _progress_bar("PyInstaller finished", 0.80)
-            _success("PyInstaller build completed.")
-
-            # =================================================================
-            # STEP 9: Locate executable
-            # =================================================================
-            _header("LOCATING EXECUTABLE")
-            self._log("")
-            self._log("--- Locating Executable ---")
-
-            dist_dir = project_dir / "dist"
-            exe_name = self._project_name + (".exe" if platform.system() == "Windows" else "")
-            exe_path = dist_dir / exe_name
-
-            if not exe_path.exists():
-                possible_exes = list(dist_dir.glob("*"))
-                if possible_exes:
-                    exe_path = possible_exes[0]
-                    self._log(f"Found executable: {exe_path}")
-                    _info(f"Executable found: {exe_path}")
-                else:
-                    raise FileNotFoundError(
-                        f"No executable found in {dist_dir}. Build may have failed."
-                    )
-            else:
-                self._log(f"Executable located: {exe_path}")
-                _success(f"Executable: {exe_path}")
-
-            exe_size_mb = exe_path.stat().st_size / (1024 * 1024)
-            _info(f"Executable size: {exe_size_mb:.1f} MB")
-            _progress_bar("Executable located", 0.85)
-
-            # =================================================================
-            # STEP 10: Code signing
-            # =================================================================
-            _header("CODE SIGNING")
-            if self._pfx_path is not None and self._pfx_password is not None:
+            # STEP: Virtual environment
+            def _step_venv():
+                nonlocal python_exe
                 self._log("")
-                self._log("--- Code Signing ---")
-                _info("Signing executable...")
+                self._log("--- Virtual Environment ---")
+                python_exe = create_project_venv(project_dir, self._log)
+                if self._fb_full():
+                    _success(f"Virtual environment ready: {python_exe}")
+                return str(python_exe)
+            _do_step(STEP_VENV, _step_venv)
+
+            # STEP: Upgrade pip
+            def _step_pip():
+                self._log("")
+                self._log("--- Upgrading pip ---")
                 try:
-                    sign_exe(
-                        exe_path, self._pfx_path, self._pfx_password,
-                        self._log, self._signtool_path
-                    )
-                    signed = True
-                    _success("Executable signed successfully.")
-                except Exception as sign_error:
-                    self._log(f"WARNING: Code signing failed: {sign_error}")
-                    _warn(f"Code signing failed: {sign_error}")
-                    signed = False
-            else:
+                    run_cmd([str(python_exe), "-m", "pip", "install", "--upgrade", "pip"], self._log)
+                    return "pip upgraded"
+                except subprocess.CalledProcessError as e:
+                    self._log(f"WARNING: pip upgrade failed: {e}")
+                    return f"pip upgrade failed (non-fatal): {e}"
+            _do_step(STEP_PIP_UPGRADE, _step_pip)
+
+            # STEP: PyInstaller check
+            def _step_pyinstaller():
                 self._log("")
-                self._log("--- Code Signing ---")
-                self._log("No certificate provided. Skipping.")
-                _info("No certificate provided. Skipping code signing.")
+                self._log("--- PyInstaller ---")
+                if not venv_has_package(python_exe, "PyInstaller"):
+                    self._log("PyInstaller not found in venv. Installing...")
+                    venv_pip_install(python_exe, "pyinstaller", log=self._log)
+                    return "PyInstaller installed"
+                else:
+                    self._log("PyInstaller is already installed.")
+                    return "PyInstaller already present"
+            _do_step(STEP_PYINSTALLER, _step_pyinstaller)
 
-            _progress_bar("Signing step complete", 0.90)
+            # STEP: Dependencies
+            def _step_deps():
+                self._log("")
+                self._log("--- Dependencies ---")
+                dep_infos = install_script_deps(python_exe, self._script_path, self._log)
+                result.dependencies = dep_infos
+                return f"{len(dep_infos)} dependencies processed"
+            _do_step(STEP_DEPENDENCIES, _step_deps)
 
-            # =================================================================
-            # STEP 11: Manifest
-            # =================================================================
-            _header("MANIFEST")
-            self._log("")
-            self._log("--- Manifest ---")
-            manifest_data = {
-                "created": datetime.datetime.now().isoformat(),
-                "author": self._author,
-                "project": self._project_name,
-                "script": str(self._script_path),
-                "exe": str(exe_path),
-                "signed": signed,
-                "pyx_version": APP_VERSION,
-                "console_mode": self._console_mode,
-                "data_folders": [str(f) for f in self._data_folders],
-            }
-            write_manifest(project_dir, manifest_data)
-            self._log(f"Manifest: {project_dir / 'pyx_manifest.json'}")
-            _success(f"Manifest written: {project_dir / 'pyx_manifest.json'}")
+            # STEP: Preprocess script
+            def _step_preprocess():
+                nonlocal temp_dir
+                self._log("")
+                self._log("--- Script Preprocessing ---")
+                temp_dir = Path(tempfile.mkdtemp(prefix="pyx_build_"))
 
-            # =================================================================
-            # STEP 12: Build log
-            # =================================================================
-            self._log("")
-            self._log("--- Build Log ---")
-            write_build_log(project_dir, self._log_lines)
-            self._log(f"Log saved to: {project_dir / 'logs'}")
+                if self._self_mode:
+                    if self._fb_full():
+                        _info("Stripping pyxwizard commands from self-referencing script...")
+                    self._log("Stripping pyxwizard library calls from script (self mode)...")
+                    stripped_script = _strip_pyxwizard_from_script(self._script_path, temp_dir)
+                    cleaned_in_project = project_dir / self._script_path.name
+                    cleaned_in_project.write_text(
+                        stripped_script.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                    self._log(f"Cleaned script written to: {cleaned_in_project}")
+                    preprocessed = preprocess_script(stripped_script, temp_dir)
+                else:
+                    preprocessed = preprocess_script(self._script_path, temp_dir)
 
-            _progress_bar("Build complete", 1.0)
+                self._log(f"Preprocessed script: {preprocessed}")
+                return str(preprocessed)
+            sr_preprocess = _do_step(STEP_PREPROCESS, _step_preprocess)
+            preprocessed_script = Path(sr_preprocess.message)
 
-            # =================================================================
-            # BUILD COMPLETE
-            # =================================================================
+            # STEP: Icon
+            def _step_icon():
+                effective = self._icon_path
+                if effective is None or not Path(effective).exists():
+                    self._log("")
+                    self._log("--- Icon ---")
+                    self._log("No custom icon provided. Downloading default icon...")
+                    effective = _download_icon(base_dir)
+                    if effective:
+                        self._log(f"Default icon: {effective}")
+                    else:
+                        self._log("WARNING: Could not download default icon.")
+                result.icon_used = effective
+                return effective or "no icon"
+            _do_step(STEP_ICON, _step_icon)
+
+            # STEP: Version info (NEW v2)
+            version_file: Optional[Path] = None
+            def _step_version_info():
+                nonlocal version_file
+                if self._version_string:
+                    self._log("")
+                    self._log("--- Version Info ---")
+                    version_file = _generate_version_info(
+                        self._version_string, self._project_name,
+                        self._author, self._description,
+                        output_path=temp_dir / "version_info.py" if temp_dir else None
+                    )
+                    if version_file:
+                        self._log(f"Version info file: {version_file}")
+                        return str(version_file)
+                return "skipped"
+            sr_vi = _do_step(STEP_VERSION_INFO, _step_version_info)
+            if sr_vi.message == "skipped":
+                step_results[-1].skipped = True
+
+            # STEP: Splash (NEW v2)
+            def _step_splash():
+                if self._splash_image:
+                    self._log("")
+                    self._log(f"--- Splash Screen ---")
+                    self._log(f"Splash image: {self._splash_image}")
+                    return self._splash_image
+                return "skipped"
+            sr_splash = _do_step(STEP_SPLASH, _step_splash)
+            if sr_splash.message == "skipped":
+                step_results[-1].skipped = True
+
+            # STEP: Pre-build hook (NEW v2)
+            def _step_pre_hook():
+                if self._hook_pre_fn:
+                    self._log("")
+                    self._log("--- Pre-Build Hook ---")
+                    self._hook_pre_fn()
+                    return "executed"
+                return "skipped"
+            sr_pre = _do_step(STEP_PRE_HOOK, _step_pre_hook)
+            if sr_pre.message == "skipped":
+                step_results[-1].skipped = True
+
+            # STEP: PyInstaller build
+            def _step_build():
+                self._log("")
+                self._log("--- PyInstaller Build ---")
+
+                if self._dry_run:
+                    self._log("DRY RUN — skipping PyInstaller execution.")
+                    return "dry run"
+
+                pyinstaller_cmd: List[str] = [
+                    str(python_exe), "-m", "PyInstaller"
+                ]
+                pyinstaller_cmd.extend(PYINSTALLER_FLAGS)
+                pyinstaller_cmd.extend(["--name", self._project_name])
+                pyinstaller_cmd.extend(["--distpath", str(project_dir / "dist")])
+                pyinstaller_cmd.extend(["--workpath", str(project_dir / "build")])
+
+                if not self._console_mode:
+                    pyinstaller_cmd.append("--noconsole")
+
+                if result.icon_used and Path(result.icon_used).exists():
+                    pyinstaller_cmd.extend(["--icon", result.icon_used])
+
+                # Version info file
+                if version_file and version_file.exists():
+                    pyinstaller_cmd.extend(["--version-file", str(version_file)])
+
+                # Splash screen
+                if self._splash_image and Path(self._splash_image).exists():
+                    pyinstaller_cmd.extend(["--splash", self._splash_image])
+
+                # Hidden imports
+                detected_imports = self._detected_imports
+                for import_name in detected_imports:
+                    top_level = import_name.split(".")[0]
+                    if top_level.isidentifier() and top_level.lower() != "pyinstaller":
+                        pyinstaller_cmd.extend(["--hidden-import", top_level])
+
+                # Collect-all
+                _COLLECT_ALL_PACKAGES: Set[str] = {
+                    "OpenGL", "glfw", "moderngl", "vispy", "pyglet",
+                    "pygame", "wx", "PyQt5", "PyQt6", "PySide2", "PySide6", "kivy",
+                    "PIL", "cv2", "imageio", "skimage",
+                    "sklearn", "scipy", "matplotlib", "numba", "shapely",
+                    "cryptography", "cffi", "nacl",
+                    "pkg_resources", "importlib_resources", "importlib_metadata",
+                }
+                if _lib_collect_all:
+                    _COLLECT_ALL_PACKAGES |= _lib_collect_all
+
+                collected_tops = {imp.split(".")[0] for imp in detected_imports}
+
+                for pkg in _COLLECT_ALL_PACKAGES:
+                    if pkg in collected_tops:
+                        pyinstaller_cmd.extend(["--collect-all", pkg])
+                        self._log(f"collect-all: {pkg}")
+
+                for pkg, hidden_list in _lib_hidden_imports.items():
+                    if pkg in collected_tops:
+                        for hi in hidden_list:
+                            pyinstaller_cmd.extend(["--hidden-import", hi])
+                        self._log(f"hidden-imports ({pkg}): {', '.join(hidden_list)}")
+
+                for imp_name, dist_name in _lib_copy_metadata.items():
+                    if imp_name in collected_tops:
+                        pyinstaller_cmd.extend(["--copy-metadata", dist_name])
+                        self._log(f"copy-metadata: {dist_name}")
+
+                # Data folders
+                separator = ";" if platform.system() == "Windows" else ":"
+                for data_folder in self._data_folders:
+                    dest_name = data_folder.name
+                    add_data_arg = f"{data_folder}{separator}{dest_name}"
+                    pyinstaller_cmd.extend(["--add-data", add_data_arg])
+                    self._log(f"add-data: {add_data_arg}")
+
+                # Extra flags (NEW v2)
+                if self._extra_flags:
+                    pyinstaller_cmd.extend(self._extra_flags)
+                    self._log(f"extra flags: {' '.join(self._extra_flags)}")
+
+                pyinstaller_cmd.append(str(preprocessed_script))
+
+                self._log(f"Command: {' '.join(str(c) for c in pyinstaller_cmd)}")
+                self._log("")
+
+                try:
+                    run_cmd(pyinstaller_cmd, self._log, cwd=str(project_dir))
+                except subprocess.CalledProcessError:
+                    self._log("WARNING: PyInstaller failed with uppercase. Trying lowercase...")
+                    pyinstaller_cmd_retry = [
+                        str(python_exe), "-m", "pyinstaller"
+                    ] + pyinstaller_cmd[3:]
+                    run_cmd(pyinstaller_cmd_retry, self._log, cwd=str(project_dir))
+
+                return "build complete"
+            _do_step(STEP_BUILD, _step_build)
+
+            # STEP: Locate executable
+            exe_path: Optional[Path] = None
+            def _step_locate():
+                nonlocal exe_path
+                self._log("")
+                self._log("--- Locating Executable ---")
+
+                if self._dry_run:
+                    self._log("DRY RUN — no executable to locate.")
+                    return "dry run"
+
+                dist_dir = project_dir / "dist"
+                exe_name = self._project_name + (".exe" if platform.system() == "Windows" else "")
+                exe_path = dist_dir / exe_name
+
+                if not exe_path.exists():
+                    possible_exes = list(dist_dir.glob("*"))
+                    if possible_exes:
+                        exe_path = possible_exes[0]
+                        self._log(f"Found executable: {exe_path}")
+                    else:
+                        raise FileNotFoundError(
+                            f"No executable found in {dist_dir}. Build may have failed."
+                        )
+                else:
+                    self._log(f"Executable located: {exe_path}")
+
+                result.exe_path = exe_path
+                result.exe_size_bytes = exe_path.stat().st_size
+                result.exe_size_mb = result.exe_size_bytes / (1024 * 1024)
+                return str(exe_path)
+            _do_step(STEP_LOCATE_EXE, _step_locate)
+
+            # STEP: Code signing
+            def _step_signing():
+                nonlocal signed
+                if self._pfx_path is not None and self._pfx_password is not None:
+                    self._log("")
+                    self._log("--- Code Signing ---")
+                    if self._dry_run:
+                        self._log("DRY RUN — skipping code signing.")
+                        return "dry run"
+                    try:
+                        sign_exe(exe_path, self._pfx_path, self._pfx_password,
+                                 self._log, self._signtool_path)
+                        signed = True
+                        return "signed"
+                    except Exception as sign_error:
+                        self._log(f"WARNING: Code signing failed: {sign_error}")
+                        return f"signing failed: {sign_error}"
+                else:
+                    self._log("")
+                    self._log("--- Code Signing ---")
+                    self._log("No certificate provided. Skipping.")
+                    return "skipped"
+            sr_sign = _do_step(STEP_SIGNING, _step_signing)
+            result.signed = signed
+            if sr_sign.message == "skipped":
+                step_results[-1].skipped = True
+
+            # STEP: Post-build hook (NEW v2)
+            def _step_post_hook():
+                if self._hook_post_fn:
+                    self._log("")
+                    self._log("--- Post-Build Hook ---")
+                    self._hook_post_fn(result)
+                    return "executed"
+                return "skipped"
+            sr_post = _do_step(STEP_POST_HOOK, _step_post_hook)
+            if sr_post.message == "skipped":
+                step_results[-1].skipped = True
+
+            # STEP: Manifest
+            def _step_manifest():
+                self._log("")
+                self._log("--- Manifest ---")
+                manifest_data = {
+                    "created": datetime.datetime.now().isoformat(),
+                    "author": self._author,
+                    "project": self._project_name,
+                    "script": str(self._script_path),
+                    "exe": str(exe_path) if exe_path else None,
+                    "signed": signed,
+                    "pyx_version": APP_VERSION,
+                    "console_mode": self._console_mode,
+                    "version_string": self._version_string,
+                    "data_folders": [str(f) for f in self._data_folders],
+                    "script_hash": result.script_hash,
+                    "dry_run": self._dry_run,
+                }
+                write_manifest(project_dir, manifest_data)
+                result.manifest_path = project_dir / "pyx_manifest.json"
+                self._log(f"Manifest: {result.manifest_path}")
+                return str(result.manifest_path)
+            _do_step(STEP_MANIFEST, _step_manifest)
+
+            # STEP: Dependency report (NEW v2)
+            def _step_report():
+                self._log("")
+                self._log("--- Dependency Report ---")
+                report_path = _write_dependency_report(
+                    project_dir, result.dependencies,
+                    self._script_path, self._project_name
+                )
+                result.report_path = report_path
+                self._log(f"Report: {report_path}")
+
+                # Environment snapshot
+                if python_exe:
+                    _create_snapshot(project_dir, python_exe, self._log)
+                    self._log(f"Snapshot: {project_dir / 'environment_snapshot.json'}")
+
+                return str(report_path)
+            _do_step(STEP_REPORT, _step_report)
+
+            # STEP: Build log
+            def _step_log():
+                self._log("")
+                self._log("--- Build Log ---")
+                write_build_log(project_dir, self._log_lines)
+                self._log(f"Log saved to: {project_dir / 'logs'}")
+                return str(project_dir / "logs")
+            _do_step(STEP_LOG, _step_log)
+
+            # COMPLETE
             elapsed = time.time() - build_start
+            result.success = True
+            result.build_duration_seconds = elapsed
+            result.step_results = step_results
+            result.log_lines = list(self._log_lines)
+
+            self._emit_step(STEP_COMPLETE)
+            self._emit_progress(1.0, "Build complete")
+
             self._log("")
             self._log(f"=== BUILD SUCCESSFUL ===")
             self._log(f"Executable: {exe_path}")
             self._log(f"Build time: {elapsed:.1f}s")
 
-            print()
-            print(f"  {S.GREEN}{S.BOLD}╔══════════════════════════════════════════════════╗{S.RESET}")
-            print(f"  {S.GREEN}{S.BOLD}║              BUILD SUCCESSFUL                    ║{S.RESET}")
-            print(f"  {S.GREEN}{S.BOLD}╚══════════════════════════════════════════════════╝{S.RESET}")
-            print()
-            _success(f"Executable:  {exe_path}")
-            _success(f"Size:        {exe_size_mb:.1f} MB")
-            _success(f"Signed:      {'Yes' if signed else 'No'}")
-            _success(f"Build time:  {elapsed:.1f}s")
-            _success(f"Log folder:  {project_dir / 'logs'}")
-            print()
+            if self._fb_finish():
+                print()
+                print(f"  {S.GREEN}{S.BOLD}╔══════════════════════════════════════════════════╗{S.RESET}")
+                print(f"  {S.GREEN}{S.BOLD}║              BUILD SUCCESSFUL                    ║{S.RESET}")
+                print(f"  {S.GREEN}{S.BOLD}╚══════════════════════════════════════════════════╝{S.RESET}")
+                print()
+                if exe_path:
+                    _success(f"Executable:  {exe_path}")
+                    _success(f"Size:        {result.exe_size_mb:.1f} MB")
+                _success(f"Signed:      {'Yes' if signed else 'No'}")
+                _success(f"Build time:  {elapsed:.1f}s")
+                _success(f"Log folder:  {project_dir / 'logs'}")
+                _success(f"Report:      {result.report_path}")
+                print()
 
-            # Print full log summary
-            _header("FULL BUILD LOG")
-            print()
-            for line in self._log_lines:
-                print(f"  {S.GREY}{line}{S.RESET}")
-            print()
+            # Save full result as JSON
+            try:
+                result_json_path = project_dir / "build_result.json"
+                result_json_path.write_text(result.to_json(), encoding="utf-8")
+            except Exception:
+                pass
 
-            return exe_path
+            return result
 
         except Exception as build_error:
+            elapsed = time.time() - build_start
             self._log("")
             self._log(f"=== BUILD FAILED ===")
             self._log(f"Error: {build_error}")
 
-            # Write log even on failure
+            result.success = False
+            result.build_duration_seconds = elapsed
+            result.error_message = str(build_error)
+            result.error_traceback = traceback.format_exc()
+            result.step_results = step_results
+            result.log_lines = list(self._log_lines)
+
             try:
                 if project_dir.exists():
                     write_build_log(project_dir, self._log_lines)
             except Exception:
                 pass
 
-            elapsed = time.time() - build_start
+            if self._fb_finish():
+                print()
+                print(f"  {S.RED}{S.BOLD}╔══════════════════════════════════════════════════╗{S.RESET}")
+                print(f"  {S.RED}{S.BOLD}║              BUILD FAILED                        ║{S.RESET}")
+                print(f"  {S.RED}{S.BOLD}╚══════════════════════════════════════════════════╝{S.RESET}")
+                print()
+                _error(f"Error: {build_error}")
+                _error(f"Build time: {elapsed:.1f}s")
+                print()
 
-            print()
-            print(f"  {S.RED}{S.BOLD}╔══════════════════════════════════════════════════╗{S.RESET}")
-            print(f"  {S.RED}{S.BOLD}║              BUILD FAILED                        ║{S.RESET}")
-            print(f"  {S.RED}{S.BOLD}╚══════════════════════════════════════════════════╝{S.RESET}")
-            print()
-            _error(f"Error: {build_error}")
-            _error(f"Build time: {elapsed:.1f}s")
-            _info(f"Check logs at: {project_dir / 'logs'}")
-            print()
-
-            # Print full log
-            _header("FULL BUILD LOG")
-            print()
-            for line in self._log_lines:
-                print(f"  {S.GREY}{line}{S.RESET}")
-            print()
-
-            return None
+            return result
 
         finally:
             if temp_dir is not None and temp_dir.exists():
@@ -1344,6 +2008,103 @@ class _PyXWizard:
                 except Exception as cleanup_error:
                     self._log(f"WARNING: Could not clean up temp dir: {cleanup_error}")
 
+    # -------------------------------------------------------------------------
+    # NEW v2: REPORT / SNAPSHOT / CLEAN / REBUILD
+    # -------------------------------------------------------------------------
+    def get_report(self) -> str:
+        """Print and return the last dependency report as a formatted string."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+
+        base_dir = self._get_base_dir()
+        if self._project_name:
+            report_path = base_dir / "PyX_Data" / self._project_name / "dependency_report.txt"
+            if report_path.exists():
+                text = report_path.read_text(encoding="utf-8")
+                if self._fb_full():
+                    print(text)
+                return text
+
+        if self._fb_full():
+            _warn("No dependency report found. Run a build first.")
+        return ""
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """Return the last environment snapshot as a dictionary."""
+        if not self._initialised:
+            raise RuntimeError("pyxwizard.begin() must be called first.")
+
+        base_dir = self._get_base_dir()
+        if self._project_name:
+            snap_path = base_dir / "PyX_Data" / self._project_name / "environment_snapshot.json"
+            if snap_path.exists():
+                return json.loads(snap_path.read_text(encoding="utf-8"))
+
+        if self._fb_full():
+            _warn("No snapshot found. Run a build first.")
+        return {}
+
+    def clean(self, project_name: Optional[str] = None) -> bool:
+        """
+        Remove build artefacts (build/, dist/) for a project, keeping the
+        venv and logs.  Pass a project name or uses the current project.
+        """
+        pname = project_name or self._project_name
+        if not pname:
+            if self._fb_full():
+                _warn("No project name specified for clean.")
+            return False
+
+        base_dir = self._get_base_dir()
+        project_dir = base_dir / "PyX_Data" / pname
+
+        if not project_dir.exists():
+            if self._fb_full():
+                _warn(f"Project directory not found: {project_dir}")
+            return False
+
+        removed = []
+        for folder_name in ["build", "dist"]:
+            folder = project_dir / folder_name
+            if folder.exists():
+                shutil.rmtree(folder)
+                removed.append(folder_name)
+
+        if self._fb_full():
+            if removed:
+                _success(f"Cleaned: {', '.join(removed)} from {project_dir}")
+            else:
+                _info("Nothing to clean.")
+
+        return bool(removed)
+
+    def purge(self, project_name: Optional[str] = None) -> bool:
+        """
+        Completely remove a project directory (venv, build, dist, logs, everything).
+        """
+        pname = project_name or self._project_name
+        if not pname:
+            if self._fb_full():
+                _warn("No project name specified for purge.")
+            return False
+
+        base_dir = self._get_base_dir()
+        project_dir = base_dir / "PyX_Data" / pname
+
+        if not project_dir.exists():
+            if self._fb_full():
+                _warn(f"Project directory not found: {project_dir}")
+            return False
+
+        shutil.rmtree(project_dir)
+        if self._fb_full():
+            _success(f"Purged: {project_dir}")
+        return True
+
+    def rebuild(self) -> "BuildResult":
+        """Re-run the build with the current configuration (shortcut)."""
+        return self.build()
+
 
 # =============================================================================
 # MODULE-LEVEL SINGLETON & PUBLIC API
@@ -1351,86 +2112,126 @@ class _PyXWizard:
 _wizard = _PyXWizard()
 
 
+# --- v1 API (unchanged) ---
 def begin() -> None:
     """Initialise PyX Wizard. Must be called before any other pyxwizard command."""
     _wizard.begin()
 
-
 def location(script_path: str) -> None:
-    """
-    Set the Python script to package.
-
-    Parameters
-    ----------
-    script_path : str
-        Path to the .py file, or "self" to package the calling script
-        (pyxwizard commands will be stripped automatically).
-    """
+    """Set the Python script to package (path or "self")."""
     _wizard.location(script_path)
-
 
 def name(project_name: str) -> None:
     """Set the project name (used as the executable filename)."""
     _wizard.name(project_name)
 
-
 def author(author_name: str = DEFAULT_AUTHOR) -> None:
     """Set the author name (optional, default TRADELY.DEV)."""
     _wizard.author(author_name)
-
 
 def console(enabled: bool = True) -> None:
     """Set console mode (True = show console, False = GUI-only)."""
     _wizard.console(enabled)
 
-
 def icon(icon_path: str) -> None:
     """Set a custom .ico icon for the executable."""
     _wizard.icon(icon_path)
 
-
 def data(*folder_paths: str) -> None:
-    """
-    Add data folders to bundle into the executable.
-
-    Files in bundled folders can be accessed at runtime using:
-        "packaged-within-exe:folder_name/file.ext"
-    """
+    """Add data folders to bundle into the executable."""
     _wizard.data(*folder_paths)
 
-
-def cert(
-    certificate_path: str,
-    password: str,
-    signtool_path: Optional[str] = None
-) -> None:
-    """
-    Set a PFX/P12 certificate for code signing.
-
-    Parameters
-    ----------
-    certificate_path : str
-        Path to the .pfx or .p12 certificate file.
-    password : str
-        The certificate password.
-    signtool_path : str, optional
-        Path to signtool.exe (auto-detected if not provided).
-    """
+def cert(certificate_path: str, password: str, signtool_path: Optional[str] = None) -> None:
+    """Set a PFX/P12 certificate for code signing."""
     _wizard.cert(certificate_path, password, signtool_path)
-
 
 def outlocation(path: str) -> None:
     """Set the base directory where PyX_Data/ will be created."""
     _wizard.outlocation(path)
 
-
-def build() -> Optional[Path]:
-    """
-    Execute the full build process.
-
-    Returns
-    -------
-    Path or None
-        The path to the built executable on success, or None on failure.
-    """
+def build() -> BuildResult:
+    """Execute the full build process. Returns a BuildResult object."""
     return _wizard.build()
+
+
+# --- v2 API (new) ---
+def version(version_str: str, description: str = "") -> None:
+    """Set a version string to embed in the EXE file properties (Windows)."""
+    _wizard.version(version_str, description)
+
+def splash(image_path: str, timeout: int = 5) -> None:
+    """Configure a splash screen image shown during EXE startup."""
+    _wizard.splash(image_path, timeout)
+
+def extra_flags(*flags: str) -> None:
+    """Add extra PyInstaller CLI flags (e.g. '--uac-admin')."""
+    _wizard.extra_flags(*flags)
+
+def hook_pre(fn: Callable[[], None]) -> None:
+    """Register a function to run just before PyInstaller executes."""
+    _wizard.hook_pre(fn)
+
+def hook_post(fn: Callable) -> None:
+    """Register a function to run after a successful build. Receives BuildResult."""
+    _wizard.hook_post(fn)
+
+def on_progress(fn: Callable[[float, str], None]) -> None:
+    """Subscribe to progress updates. fn(value: 0.0–1.0, label: str)."""
+    _wizard.on_progress(fn)
+
+def on_log(fn: Callable[[str], None]) -> None:
+    """Subscribe to log messages. fn(message: str)."""
+    _wizard.on_log(fn)
+
+def on_step(fn: Callable[[str, str, float], None]) -> None:
+    """Subscribe to step changes. fn(step_id, label, progress)."""
+    _wizard.on_step(fn)
+
+def feedback(mode: str = "full") -> None:
+    """
+    Set the terminal output level.
+
+    Parameters
+    ----------
+    mode : str
+        "full"   — all output: banner, headers, progress bars, per-line detail (default)
+        "step"   — step headers and summary only, no per-line detail
+        "finish" — only the final BUILD SUCCESSFUL / BUILD FAILED summary
+        "none"   — no terminal output at all (callbacks still fire)
+    """
+    _wizard.feedback(mode)
+
+def dry_run(enabled: bool = True) -> None:
+    """Enable dry-run mode — validates everything but skips PyInstaller."""
+    _wizard.dry_run(enabled)
+
+def report() -> str:
+    """Print and return the last dependency report."""
+    return _wizard.get_report()
+
+def snapshot() -> Dict[str, Any]:
+    """Return the last environment snapshot as a dictionary."""
+    return _wizard.get_snapshot()
+
+def clean(project_name: Optional[str] = None) -> bool:
+    """Remove build artefacts (build/, dist/) for a project."""
+    return _wizard.clean(project_name)
+
+def purge(project_name: Optional[str] = None) -> bool:
+    """Completely remove a project directory."""
+    return _wizard.purge(project_name)
+
+def rebuild() -> BuildResult:
+    """Re-run the build with the current configuration."""
+    return _wizard.rebuild()
+
+def get_steps() -> List[Dict[str, Any]]:
+    """Return the list of all build steps with their IDs, labels, and progress values."""
+    return [
+        {"id": s, "label": STEP_LABELS[s], "progress": STEP_PROGRESS[s]}
+        for s in ALL_STEPS
+    ]
+
+def get_version() -> str:
+    """Return the pyxwizard library version string."""
+    return APP_VERSION
