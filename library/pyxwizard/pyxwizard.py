@@ -93,7 +93,7 @@ except ImportError:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-APP_VERSION = "0.29.4"
+APP_VERSION = "0.29.5"
 DEFAULT_AUTHOR = "TRADELY.DEV"
 PYINSTALLER_FLAGS = ["--onefile", "--clean", "--noconfirm"]
 DEFAULT_ICON_URL = "https://doc.tradely.dev/images/tradely.ico"
