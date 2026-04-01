@@ -1,6 +1,6 @@
-# PyX Wizard — Library Edition v0.29.2
+# PyX Wizard — Library Edition v0.29.4
 
-**Python → EXE Builder**  
+**Python → EXE Builder**
 Package Python scripts into standalone Windows executables from code.
 
 ## Quick Start
@@ -29,7 +29,7 @@ pyxwizard.build()
 | `pyxwizard.outlocation(path)` | No | Script dir | Where to put `PyX_Data/` |
 | `pyxwizard.build()` | Yes | — | Run the build, returns `BuildResult` |
 | `pyxwizard.version(ver, desc?)` | No | None | Embed version in EXE file properties |
-| `pyxwizard.splash(image, timeout?)` | No | None | Splash screen on EXE startup |
+| `pyxwizard.splash(image, timeout?)` | No | None | Splash screen on EXE startup (auto-installs Pillow) |
 | `pyxwizard.extra_flags(f1, f2, ...)` | No | None | Pass extra flags to PyInstaller |
 | `pyxwizard.hook_pre(fn)` | No | None | Run a function before PyInstaller |
 | `pyxwizard.hook_post(fn)` | No | None | Run a function after build (gets `BuildResult`) |
@@ -40,10 +40,12 @@ pyxwizard.build()
 
 Control how much terminal output PyX Wizard produces during a build.
 
+`feedback()` and callbacks (`on_progress`, `on_log`, `on_step`) can be set **before** `begin()` — they persist across `begin()` calls and are never silently reset.
+
 ```python
 import pyxwizard
 
-pyxwizard.feedback("step")   # Only show step headers + final result
+pyxwizard.feedback("step")   # Safe to set before begin()
 pyxwizard.begin()
 pyxwizard.location("my_script.py")
 pyxwizard.name("MyApp")
@@ -66,10 +68,10 @@ Wire PyX Wizard directly into your GUI without any terminal noise.
 ```python
 import pyxwizard
 
-# Suppress all terminal output
+# Suppress all terminal output — can be set before begin()
 pyxwizard.feedback("none")
 
-# Wire your widgets
+# Wire your widgets — these also persist across begin() calls
 pyxwizard.on_progress(my_progress_bar.set)    # fn(value: 0.0–1.0, label: str)
 pyxwizard.on_log(my_textbox.append)           # fn(message: str)
 pyxwizard.on_step(my_sidebar.update)          # fn(step_id: str, label: str, progress: float)
@@ -88,7 +90,7 @@ result = pyxwizard.build()
 
 ## BuildResult
 
-`pyxwizard.build()` returns a `BuildResult` object with everything you need.
+`pyxwizard.build()` returns a `BuildResult` object with everything you need. `BuildResult` is truthy when the build succeeds, so `if result:` works as expected.
 
 ```python
 result = pyxwizard.build()
@@ -99,6 +101,10 @@ if result.success:
     print(f"Time: {result.build_duration_seconds:.1f}s")
 else:
     print(f"Failed: {result.error_message}")
+
+# Also works:
+if result:
+    print("Build succeeded!")
 ```
 
 | Property | Type | Description |
@@ -168,9 +174,19 @@ Every build produces the following files inside `PyX_Data/<project>/`:
 
 - **Version info**: `pyxwizard.version("1.2.3")` embeds file properties visible in Windows Explorer → right-click → Properties → Details tab.
 
-- **Splash screen**: `pyxwizard.splash("splash.png")` requires PyInstaller 4.6+ and Tkinter available in the target environment.
+- **Splash screen**: `pyxwizard.splash("splash.png")` requires PyInstaller 4.6+ and Tkinter available in the target environment. As of v0.29.4, Pillow is automatically installed in the build venv if needed, and tkinter availability is validated before the build — if tkinter is missing, the splash flag is silently skipped with a warning instead of failing the build.
 
 - **Dry run**: `pyxwizard.dry_run(True)` runs every step (venv, deps, preprocessing) except the actual PyInstaller build — useful for validating your config.
+
+- **Feedback & callback persistence**: `pyxwizard.feedback()`, `on_progress()`, `on_log()`, and `on_step()` can be called before `begin()`. They are not reset when `begin()` runs, so you can wire up your GUI once and call `begin()` + `build()` multiple times.
+
+## Changelog (v0.29.4)
+
+- **Fixed**: Splash screen builds no longer fail — Pillow is now auto-installed in the venv and tkinter availability is checked before the build.
+- **Fixed**: `feedback()` and callback registrations (`on_progress`, `on_log`, `on_step`) now persist across `begin()` calls instead of being silently reset.
+- **Fixed**: `build()` return type corrected from `Union[Optional[Path], BuildResult]` to `BuildResult`.
+- **Fixed**: `BuildResult` now supports `bool()` — `if result:` works as documented.
+- **Fixed**: Removed broken uppercase/lowercase PyInstaller retry logic; PyInstaller errors now surface the last 30 lines of output for easier debugging.
 
 ## Further Details
 
