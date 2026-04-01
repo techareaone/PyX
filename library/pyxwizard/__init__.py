@@ -5,7 +5,7 @@ A Python library that packages Python scripts into standalone Windows
 executables using PyInstaller, with automatic dependency detection,
 virtual environment isolation, optional code signing, and data bundling.
 
-Version: 0.29.4
+Version: 0.29.5
 Author:  TRADELY.DEV
 """
 from .pyxwizard import (
