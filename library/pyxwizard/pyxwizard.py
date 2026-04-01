@@ -282,6 +282,20 @@ else:
 ''')
 
 
+INJECTED_SPLASH_CLOSER = textwrap.dedent('''\
+# --- PyX Wizard: injected splash closer (start) ---
+# Close the PyInstaller splash screen once the app's Python code begins
+# executing.  pyi_splash is only available inside a frozen --splash build,
+# so the ImportError is expected during normal script execution.
+try:
+    import pyi_splash as _pyx_splash  # type: ignore[import-not-found]
+    _pyx_splash.close()
+except ImportError:
+    pass
+# --- PyX Wizard: injected splash closer (end) ---
+''')
+
+
 # =============================================================================
 # DATA CLASSES – Build Results & Dependency Info
 # =============================================================================
@@ -759,8 +773,23 @@ def _download_icon(base_dir: Path) -> Optional[str]:
         return None
 
 
-def preprocess_script(script_path: Path, temp_dir: Path) -> Path:
-    """Create a preprocessed copy of the target script with injected helpers."""
+def preprocess_script(
+    script_path: Path,
+    temp_dir: Path,
+    splash_enabled: bool = False,
+) -> Path:
+    """Create a preprocessed copy of the target script with injected helpers.
+
+    Parameters
+    ----------
+    script_path : Path
+        The original (or self-stripped) script to preprocess.
+    temp_dir : Path
+        Temporary directory for the preprocessed output.
+    splash_enabled : bool
+        When True, inject code that closes the PyInstaller splash screen
+        once the app's Python code begins executing.
+    """
     source_code = script_path.read_text(encoding="utf-8", errors="replace")
     lines = source_code.split("\n")
 
@@ -790,6 +819,22 @@ def preprocess_script(script_path: Path, temp_dir: Path) -> Path:
             for offset, helper_line in enumerate(helper_lines):
                 lines.insert(injection_position + offset, helper_line)
 
+        # Inject splash closer right after the path helper block
+        if splash_enabled and "# --- PyX Wizard: injected splash closer (start) ---" not in source_code:
+            # Find the end of the path helper we just inserted
+            splash_pos = None
+            for idx, line in enumerate(lines):
+                if "# --- PyX Wizard: injected path helper (end) ---" in line:
+                    splash_pos = idx + 1
+                    break
+            if splash_pos is None:
+                # Path helper wasn't injected (had top-level resolver) —
+                # fall back to right after the last import.
+                splash_pos = last_import_line_index + 1 if last_import_line_index >= 0 else 0
+            splash_lines = INJECTED_SPLASH_CLOSER.split("\n")
+            for offset, splash_line in enumerate(splash_lines):
+                lines.insert(splash_pos + offset, splash_line)
+
         modified_source = "\n".join(lines)
 
         packaged_pattern = re.compile(
@@ -799,6 +844,11 @@ def preprocess_script(script_path: Path, temp_dir: Path) -> Path:
             r'_resolve_packaged_path("\g<relpath>")',
             modified_source
         )
+
+    # Even if has_toplevel_resolver was True we still need splash closer
+    if has_toplevel_resolver and splash_enabled:
+        if "# --- PyX Wizard: injected splash closer (start) ---" not in modified_source:
+            modified_source = INJECTED_SPLASH_CLOSER + "\n" + modified_source
 
     temp_script_path = temp_dir / script_path.name
     temp_script_path.write_text(modified_source, encoding="utf-8")
@@ -1639,6 +1689,10 @@ class _PyXWizard:
                 self._log("--- Script Preprocessing ---")
                 temp_dir = Path(tempfile.mkdtemp(prefix="pyx_build_"))
 
+                # Splash closer is injected into the script so it
+                # auto-closes once the app's Python code starts running.
+                _splash = bool(self._splash_image)
+
                 if self._self_mode:
                     if self._fb_full():
                         _info("Stripping pyxwizard commands from self-referencing script...")
@@ -1649,9 +1703,9 @@ class _PyXWizard:
                         stripped_script.read_text(encoding="utf-8"), encoding="utf-8"
                     )
                     self._log(f"Cleaned script written to: {cleaned_in_project}")
-                    preprocessed = preprocess_script(stripped_script, temp_dir)
+                    preprocessed = preprocess_script(stripped_script, temp_dir, splash_enabled=_splash)
                 else:
-                    preprocessed = preprocess_script(self._script_path, temp_dir)
+                    preprocessed = preprocess_script(self._script_path, temp_dir, splash_enabled=_splash)
 
                 self._log(f"Preprocessed script: {preprocessed}")
                 return str(preprocessed)
