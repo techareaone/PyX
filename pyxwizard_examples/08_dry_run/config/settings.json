@@ -1,0 +1,8 @@
+{
+    "app_name": "ComplexApp",
+    "version": "0.1.0-beta",
+    "feature_flags": {
+        "dark_mode": true,
+        "telemetry": false
+    }
+}

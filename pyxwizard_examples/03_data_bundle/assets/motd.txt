@@ -1,0 +1,1 @@
+Welcome to DataReaderApp — successfully reading bundled assets from inside the EXE!

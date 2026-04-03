@@ -1,0 +1,8 @@
+{
+    "title": "System Monitor v1.3.2",
+    "refresh_ms": 1500,
+    "show_cpu": true,
+    "show_memory": true,
+    "show_disk": false,
+    "theme": "green-on-black"
+}
