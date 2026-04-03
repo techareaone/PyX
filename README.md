@@ -1,4 +1,4 @@
-# PyX Wizard — EXE Builder (GUI Version)
+# PyX Wizard — EXE Builder
 
 > A [TRADELY](https://doc.tradely.dev) Project
 
@@ -23,60 +23,11 @@ PyX wraps [PyInstaller](https://pyinstaller.org) with a guided interface and add
 
 ## Distribution
 
-PyX is distributed as a pre-built Windows executable. The repository release contains:
-
-| File | Description |
-|------|-------------|
-| `PyX.exe` | The compiled application. Run this directly — no Python installation required on the end-user machine. |
-| `PyX_V0_28_BETA.py` | The full source file included alongside the executable for transparency and developer reference. |
-| `signtool/signtool.exe` | Microsoft SignTool, bundled for code-signing support. |
-
-Output files from each build are placed under a `PyX_Data/` directory next to the executable.
-
----
-
-## Requirements
-
-**To run the PyX executable:** none. The executable is self-contained.
-
-**To run the source file directly** (developer use):
-
-- Python 3.10 or later
-- `customtkinter` — `pip install customtkinter`
-- `cryptography` *(optional, for PFX validation)* — `pip install cryptography`
+PyX is distributed as a pre-built Windows executable in releases. It can also be used as a python library using `pip install pyxwizard`.
 
 **For builds to succeed on the target machine**, Python must be installed and available on `PATH`. PyX creates its own virtual environment and installs PyInstaller inside it; it does not use the system Python environment for anything other than bootstrapping.
 
----
-
-## Project Structure
-
-```
-PyX.exe                        ← Distributed executable
-PyX_V0_28_BETA.py              ← Source file
-signtool/
-    signtool.exe               ← Bundled Microsoft SignTool
-PyX_Data/                      ← Created on first build
-    <ProjectName>/
-        venv/                  ← Isolated virtual environment
-        build/                 ← PyInstaller intermediate files
-        dist/                  ← Final executable output
-        logs/                  ← Timestamped build logs
-        pyx_manifest.json      ← Build metadata
-```
-
----
-
-## Wizard Steps
-
-| Step | Name | Description |
-|------|------|-------------|
-| 0 | Welcome | Overview, antivirus guidance, feature summary. |
-| 1 | Script | Select the `.py` file to build. Imports are detected and displayed. |
-| 2 | Config | Set project name, console/GUI mode, and optional custom icon. |
-| 3 | Data | Optionally bundle data folders into the executable. |
-| 4 | Certificate | Optionally select a PFX/P12 certificate for code signing. |
-| 5 | Build | Execute the build, view streaming logs, and open output. |
+SignTool must be installed if signing certificates using the library. It comes pre-packaged with the EXE Wizard.
 
 ---
 
