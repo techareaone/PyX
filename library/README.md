@@ -1,4 +1,4 @@
-# PyX Wizard — Library Edition v0.29.4
+# PyX Wizard — Library Edition v0.29.5
 
 **Python → EXE Builder**
 Package Python scripts into standalone Windows executables from code.
